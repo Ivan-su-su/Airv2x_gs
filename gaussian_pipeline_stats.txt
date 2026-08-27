@@ -1,0 +1,92 @@
+=== synthetic inputs ===
+voxel_features: shape=(32, 16) dtype=torch.float32 mean=0.062463 std=1.01601 min=-3.15372 max=4.10149
+lidar_mask shape=(2, 8, 16, 16) (B,Z,Y,X)
+  B=0: true_voxels=512 / 2048 (25.00%)
+  B=1: true_voxels=512 / 2048 (25.00%)
+=== injected gaussian_candidates (per-hit, pre-fusion) ===
+num_hits=10 unique_group_ids=[0, 1, 2, 3, 4]
+hit_idx | group_id | local_B | view_id
+   0    |        0 |       0 |       0
+   1    |        0 |       0 |       1
+   2    |        1 |       0 |       0
+   3    |        1 |       0 |       1
+   4    |        2 |       0 |       0
+   5    |        2 |       0 |       1
+   6    |        3 |       1 |       0
+   7    |        3 |       1 |       1
+   8    |        4 |       1 |       0
+   9    |        4 |       1 |       1
+hits per (local_B, view_id):
+  (B=0, V=0): 3
+  (B=0, V=1): 3
+  (B=1, V=0): 2
+  (B=1, V=1): 2
+=== first_round_gaussians (after cross-attn + multiview fuse) ===
+num_groups_G=5 source_group_ids=[0, 1, 2, 3, 4]
+fused mean [G,3]: shape=(5, 3) dtype=torch.float32 mean=4.72886 std=6.90524 min=-0.366269 max=16.0308
+  values: [0.13813886046409607, -0.0742340013384819, 14.001548767089844, -0.366268515586853, 0.050920262932777405, 16.030759811401367, 0.44346028566360474, 0.1169147863984108, 12.980611801147461, -0.21079722046852112, -0.10895046591758728, 15.006940841674805, 0.22557377815246582, 0.2193584442138672, 12.478998184204102]
+fused feature [G,C]: shape=(5, 64) dtype=torch.float32 mean=-0.0186854 std=0.355138 min=-1.07951 max=0.976189
+num_valid_views (hits merged per group): [2, 2, 2, 2, 2]
+multi_view_group_mask (count>1): [True, True, True, True, True]
+local_agent_mask [G,B] shape=(5, 2) — True => this Gaussian is evaluated for that batch column when projecting / refining.
+  G=0 (src_gid=0): B0=1 B1=0
+  G=1 (src_gid=1): B0=1 B1=0
+  G=2 (src_gid=2): B0=1 B1=0
+  G=3 (src_gid=3): B0=0 B1=1
+  G=4 (src_gid=4): B0=0 B1=1
+first_round view_weights len=10 (per original hit row in fuse_groups)
+  group_row=0 (src hits): weights sum=1.000000 min=0.496416 max=0.503584 values=[0.4964160919189453, 0.5035839080810547]
+  group_row=1 (src hits): weights sum=1.000000 min=0.497497 max=0.502503 values=[0.5025030970573425, 0.49749693274497986]
+  group_row=2 (src hits): weights sum=1.000000 min=0.496877 max=0.503123 values=[0.4968765676021576, 0.50312340259552]
+  group_row=3 (src hits): weights sum=1.000000 min=0.498794 max=0.501206 values=[0.5012063384056091, 0.49879372119903564]
+  group_row=4 (src hits): weights sum=1.000000 min=0.496564 max=0.503436 values=[0.4965641498565674, 0.5034358501434326]
+=== second_round_gaussians ===
+refined_gaussian_mask [G]: [1, 1, 1, 1, 1] (True => had valid projection hit + cross-attn + fuse this round)
+second mean [G,3]: shape=(5, 3) dtype=torch.float32 mean=4.80786 std=7.04315 min=-0.484171 max=16.2187
+  values: [0.43995964527130127, -0.374710351228714, 14.195361137390137, -0.13076534867286682, -0.26969659328460693, 16.218730926513672, 0.7778996229171753, -0.17000597715377808, 13.13605785369873, 0.10016560554504395, -0.48417145013809204, 15.422499656677246, 0.6099674105644226, -0.18084022402763367, 12.827512741088867]
+second feature [G,C]: shape=(5, 64) dtype=torch.float32 mean=0.0325493 std=0.294742 min=-0.812037 max=0.849238
+second num_valid_views (subset): [2, 2, 2, 2, 2]
+second multi_view_group_mask: [1, 1, 1, 1, 1]
+=== geometry / feature delta (second vs first, same G index) ===
+|Δmean| per-G: shape=(5,) dtype=torch.float32 mean=0.534178 std=0.104519 min=0.439989 max=0.655271
+  values: [0.4679156541824341, 0.4399886727333069, 0.4672650694847107, 0.6404512524604797, 0.6552708148956299]
+|Δscale| per-G: shape=(5,) dtype=torch.float32 mean=0.103882 std=0.0193878 min=0.089534 max=0.134549
+  values: [0.0895339846611023, 0.09068602323532104, 0.0928824245929718, 0.13454945385456085, 0.1117597296833992]
+Δquat vec-L2 per-G (not rotation angle): shape=(5,) dtype=torch.float32 mean=1.29996 std=0.160715 min=1.02035 max=1.41276
+  values: [1.3289858102798462, 1.3365833759307861, 1.0203548669815063, 1.4011050462722778, 1.4127639532089233]
+quat_geodesic_deg (first↔second): shape=(5,) dtype=torch.float32 mean=162.934 std=23.2474 min=122.703 max=179.765
+  values: [166.57374572753906, 167.7414093017578, 122.70259857177734, 177.8853759765625, 179.76519775390625]
+|Δfeature| per-G: shape=(5,) dtype=torch.float32 mean=3.48313 std=0.267155 min=3.21493 max=3.89725
+  values: [3.4106521606445312, 3.214930772781372, 3.3158175945281982, 3.8972535133361816, 3.576995372772217]
+per-G breakdown (only refined typically has non-zero Δmean from FGU):
+  G=0 refined=True |Δm|=0.467916 |Δs|=0.089534 Δq_vecL2=1.32899 rot_deg=166.6 |Δc|=3.41065
+  G=1 refined=True |Δm|=0.439989 |Δs|=0.090686 Δq_vecL2=1.33658 rot_deg=167.7 |Δc|=3.21493
+  G=2 refined=True |Δm|=0.467265 |Δs|=0.0928824 Δq_vecL2=1.02035 rot_deg=122.7 |Δc|=3.31582
+  G=3 refined=True |Δm|=0.640451 |Δs|=0.134549 Δq_vecL2=1.40111 rot_deg=177.9 |Δc|=3.89725
+  G=4 refined=True |Δm|=0.655271 |Δs|=0.11176 Δq_vecL2=1.41276 rot_deg=179.8 |Δc|=3.577
+=== GaussianToImageProjector (second round) — mask / pairing logic ===
+Step A: local_agent_mask[G,B] -> valid (G,B) pairs (Cartesian membership). Only these pairs are considered for projecting that Gaussian's keypoints.
+Step B: For each pair, project ALL keypoints to ALL views; depth>0 and norm coords in (0,1). hit_mask = any keypoint valid per (pair, view). Emit one row per (pair,view) with a valid hit.
+Step C: normalized_coords = sampling_coords[:,0] (first support sample = center path in DA). Downstream uses gaussian_ids, local_agent_ids, view_ids, sampling_coords, sampling_valid_mask.
+key_points shape [G, P, 3]: G=5 P=7
+local_agent_mask: num_valid_(G,B)_pairs=5
+projection output rows (valid (G,B,V) hits with any in-bounds keypoint): 10
+projection hits per (B, V):
+  (B=0, V=0): 3 rows
+  (B=0, V=1): 3 rows
+  (B=1, V=0): 2 rows
+  (B=1, V=1): 2 rows
+sampling_valid_mask shape [N,P]: P=7 — fraction True per sample index: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+first 16 projection rows: gaussian_id local_B view_id valid[0:4]...
+  j= 0 g= 0 B=0 V=0 valid_head=[1, 1, 1, 1]
+  j= 1 g= 0 B=0 V=1 valid_head=[1, 1, 1, 1]
+  j= 2 g= 1 B=0 V=0 valid_head=[1, 1, 1, 1]
+  j= 3 g= 1 B=0 V=1 valid_head=[1, 1, 1, 1]
+  j= 4 g= 2 B=0 V=0 valid_head=[1, 1, 1, 1]
+  j= 5 g= 2 B=0 V=1 valid_head=[1, 1, 1, 1]
+  j= 6 g= 3 B=1 V=0 valid_head=[1, 1, 1, 1]
+  j= 7 g= 3 B=1 V=1 valid_head=[1, 1, 1, 1]
+  j= 8 g= 4 B=1 V=0 valid_head=[1, 1, 1, 1]
+  j= 9 g= 4 B=1 V=1 valid_head=[1, 1, 1, 1]
+=== lidar_mask note ===
+Synthetic lidar_mask is NOT wired into candidate construction in this script; it only documents B-major occupancy stats. To couple mask->hits, index voxels where mask True.

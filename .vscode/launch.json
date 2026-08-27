@@ -1,0 +1,24 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Debug train.py on remote",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/opencood/tools/train.py",
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal",
+      "justMyCode": false,
+      "python": "/mnt/home/suyi/miniconda3/envs/mambafusion/bin/python",
+      "args": [
+        "-y",
+        "/mnt/home/suyi/AirV2X-Perception-Checkpoints/airv2x_intermediate_gs/config.yaml",
+        "--gpu_id",
+        "5"
+      ],
+      "env": {
+        "PYTHONPATH": "${workspaceFolder}"
+      }
+    }
+  ]
+}
