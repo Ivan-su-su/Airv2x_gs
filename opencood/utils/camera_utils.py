@@ -51,8 +51,11 @@ def sample_augmentation(data_aug_conf, is_train):
         resize_dims = (int(W*resize), int(H*resize))
         newW, newH = resize_dims
         crop_h = int((1 - np.mean(data_aug_conf['bot_pct_lim']))*newH) - fH
-        # crop_h = newH - fH
         crop_w = int(max(0, newW - fW) / 2)
+        # Eval resize is often exactly final_dim (720x1280 → 360x640).
+        # bot_pct then yields crop_h < 0; PIL fills the OOB region with black.
+        crop_h = int(np.clip(crop_h, 0, max(0, newH - fH)))
+        crop_w = int(np.clip(crop_w, 0, max(0, newW - fW)))
         crop = (crop_w, crop_h, crop_w + fW, crop_h + fH)
         flip = False
         rotate = 0
@@ -237,6 +240,232 @@ normalize_img = torchvision.transforms.Compose(
         ),
     )
 )
+
+# P1 night pre-lighten. Inverse of the audited C2/C3 darkening:
+# I_L1 = clip((I / 0.35) ** (1 / 1.8), 0, 1)
+# I_L2 = clip((I / 0.25) ** (1 / 2.0), 0, 1)
+# Dataset encode applies L2_hl (L2 + highlight compress) on the two
+# true-night scenario folders only. Depth is never lifted.
+L2_TRAIN_SCENARIO_ID = "2025_05_06_10_01_50"
+L2_TEST_SCENARIO_ID = "2025_05_10_19_54_35"
+L2_SCENARIO_IDS = (L2_TRAIN_SCENARIO_ID, L2_TEST_SCENARIO_ID)
+L1_GAIN = 0.35
+L1_GAMMA = 1.8
+L2_GAIN = 0.25
+L2_GAMMA = 2.0
+L2_EPS = 1e-8
+_IMAGENET_MEAN = [0.485, 0.456, 0.406]
+_IMAGENET_STD = [0.229, 0.224, 0.225]
+
+
+def is_l2_train_night_scenario(metadata_path, is_train=None):
+    """True iff ``metadata_path`` is one of the two listed L2 scenarios.
+
+    * TRAIN night: ``2025_05_06_10_01_50``
+    * TEST night: ``2025_05_10_19_54_35``
+
+    Split is identified by the scenario folder name, not by ``is_train``,
+    clock time, or luminance. ``is_train`` is kept for call-site compatibility
+    and is unused.
+    """
+    del is_train
+    if metadata_path is None:
+        return False
+    parts = str(metadata_path).replace("\\", "/").split("/")
+    return any(sid in parts for sid in L2_SCENARIO_IDS)
+
+
+def _apply_gain_gamma_rgb(rgb, gain, gamma, eps=L2_EPS):
+    """Apply ``clip((I / gain) ** (1 / gamma), 0, 1)`` to display RGB."""
+    out = rgb.clone() if torch.is_tensor(rgb) else torch.as_tensor(rgb)
+    rgb_ch = out[:3].clamp(min=0.0, max=1.0)
+    scaled = rgb_ch / float(gain)
+    scaled = torch.where(scaled < 0, scaled.new_full(scaled.shape, float(eps)), scaled)
+    out[:3] = torch.clamp(torch.pow(scaled, 1.0 / float(gamma)), 0.0, 1.0)
+    return out
+
+
+def apply_l1_display_rgb(rgb, eps=L2_EPS):
+    """Apply the audited L1 pre-lighten to display RGB in ``[0, 1]``.
+
+    ``I_L1 = clip((I / 0.35) ** (1 / 1.8), 0, 1)``. Inverse of C2 darkening.
+    Extra channels are unchanged.
+
+    Args:
+        rgb: Float tensor ``[3, H, W]`` or ``[C, H, W]`` with RGB in ``0:3``.
+        eps: Numerical floor used only when ``I / 0.35`` is negative.
+
+    Returns:
+        Tensor with RGB channels L1-transformed; extra channels unchanged.
+    """
+    return _apply_gain_gamma_rgb(rgb, L1_GAIN, L1_GAMMA, eps=eps)
+
+
+def apply_l2_display_rgb(rgb, eps=L2_EPS):
+    """Apply the audited L2 pre-lighten to display RGB in ``[0, 1]``.
+
+    ``I_L2 = clip((I / 0.25) ** (1 / 2.0), 0, 1)``, equivalently
+    ``clip(sqrt(I / 0.25), 0, 1)``. ``eps`` is applied only if the scaled
+    base would otherwise be negative (should not happen for display RGB).
+
+    Args:
+        rgb: Float tensor ``[3, H, W]`` or ``[C, H, W]`` with RGB in ``0:3``.
+        eps: Numerical floor used only when ``I / 0.25`` is negative.
+
+    Returns:
+        Tensor with RGB channels L2-transformed; extra channels unchanged.
+    """
+    return _apply_gain_gamma_rgb(rgb, L2_GAIN, L2_GAMMA, eps=eps)
+
+
+# After L2, streetlights/road sit near 1 and clip. Soft-knee on the lifted
+# image, then blend original back where source luma is already high.
+L2_HL_KNEE = 0.50
+L2_HL_STRENGTH = 3.0
+L2_HL_BLEND_LO = 0.12
+L2_HL_BLEND_HI = 0.35
+
+
+def _smoothstep01(x, lo, hi):
+    """Hermite smoothstep of ``x`` from ``lo`` to ``hi``, clamped to ``[0, 1]``."""
+    span = float(hi) - float(lo)
+    t = ((x - float(lo)) / span).clamp(0.0, 1.0)
+    return t * t * (3.0 - 2.0 * t)
+
+
+def apply_l2_highlight_compress(rgb, eps=L2_EPS):
+    """L2 lift, then compress highlights so bright night views keep texture.
+
+    1. ``I_L2 = clip(sqrt(I / 0.25), 0, 1)``
+    2. Soft-knee above ``L2_HL_KNEE``: leftover is ``over / (1 + k * over)``
+    3. Blend original RGB back with a luma smoothstep
+       ``[L2_HL_BLEND_LO, L2_HL_BLEND_HI]`` so streetlights are not clipped.
+
+    Shadows still get full L2. Extra channels unchanged. This is the
+    night RGB path used by ``encode_rgb_for_p1``.
+
+    Args:
+        rgb: Float tensor ``[3, H, W]`` or ``[C, H, W]`` with RGB in ``0:3``.
+        eps: Forwarded to L2 for a negative-base guard.
+
+    Returns:
+        Tensor with RGB channels L2+highlight-compressed.
+    """
+    out = rgb.clone() if torch.is_tensor(rgb) else torch.as_tensor(rgb)
+    src = out[:3].clamp(min=0.0, max=1.0)
+    lifted = apply_l2_display_rgb(out, eps=eps)[:3]
+    over = (lifted - float(L2_HL_KNEE)).clamp(min=0.0)
+    lifted_c = torch.clamp(
+        lifted - over + over / (1.0 + float(L2_HL_STRENGTH) * over), 0.0, 1.0
+    )
+    luma = 0.299 * src[0] + 0.587 * src[1] + 0.114 * src[2]
+    blend = _smoothstep01(luma, L2_HL_BLEND_LO, L2_HL_BLEND_HI)
+    out = out.clone()
+    out[:3] = (1.0 - blend) * lifted_c + blend * src
+    return out
+
+
+def encode_rgb_for_p1(pil_rgb, apply_l2=False):
+    """ImageNet-normalize a geometrically transformed PIL RGB image.
+
+    If ``apply_l2`` is True, L2_hl (L2 + highlight compress) is applied on
+    the ``[0, 1]`` tensor after ``ToTensor`` and before ImageNet mean/std.
+    Gate remains the two true-night scenario folders. Depth must not be
+    passed here.
+    """
+    if not apply_l2:
+        return normalize_img(pil_rgb)
+    rgb = torchvision.transforms.functional.to_tensor(pil_rgb)
+    rgb = apply_l2_highlight_compress(rgb)
+    return imagenet_normalize_display_rgb(rgb)
+
+
+def imagenet_normalize_display_rgb(rgb):
+    """ImageNet-normalize a display RGB tensor already in ``[0, 1]``.
+
+    Args:
+        rgb: Float tensor ``[3, H, W]`` (extra channels not allowed).
+
+    Returns:
+        Normalized RGB tensor, same shape.
+    """
+    return torchvision.transforms.functional.normalize(
+        rgb, mean=_IMAGENET_MEAN, std=_IMAGENET_STD
+    )
+
+
+# TRAIN-only physics fog on non-night scenes. Not applied to L2 night folders.
+FOG_ATMOSPHERIC_LIGHT = 0.75
+FOG_SAMPLE_FRACTION = 0.40
+FOG_BETA_RANGE = {
+    "vehicle": (0.02, 0.05),
+    "rsu": (0.02, 0.05),
+    "drone": (0.001, 0.005),
+}
+FOG_EPOCH_SEED = 20260828
+FOG_FAR_M = 1000.0
+
+
+def camera_optical_ray_range(z, intrins, post_rots, post_trans, far_m=FOG_FAR_M):
+    """Euclidean ray range from optical-axis z after undoing eval post-homography.
+
+    Matches LSS ``get_geometry``: undo ``post_rots``/``post_trans``, then
+    ``rho = z * ||K^{-1}[u', v', 1]||``. ``z`` is camera optical-axis depth
+    in meters. Non-finite or ``z <= 0`` is replaced by ``far_m`` (CARLA far
+    plane) so those pixels get far-field fog instead of ``t=1``.
+
+    Args:
+        z: Float tensor ``[H, W]`` optical-axis depth in meters.
+        intrins: Original camera ``K``, ``[3, 3]``.
+        post_rots: Image post-homography 3x3 (resize/crop).
+        post_trans: Image post-translation length-3.
+        far_m: Fallback distance for invalid z.
+
+    Returns:
+        Float tensor ``[H, W]`` ray range ``rho`` in meters.
+    """
+    z_use = z.to(dtype=torch.float32)
+    invalid = (~torch.isfinite(z_use)) | (z_use <= 0)
+    z_use = torch.where(invalid, z_use.new_full(z_use.shape, float(far_m)), z_use)
+    height, width = z_use.shape
+    ys = torch.arange(height, device=z_use.device, dtype=torch.float32)
+    xs = torch.arange(width, device=z_use.device, dtype=torch.float32)
+    grid_y, grid_x = torch.meshgrid(ys, xs, indexing="ij")
+    pix = torch.stack(
+        [grid_x, grid_y, torch.ones_like(grid_x)], dim=-1
+    )
+    k_mat = intrins.to(device=z_use.device, dtype=torch.float32)
+    post_r = post_rots.to(device=z_use.device, dtype=torch.float32)
+    post_t = post_trans.to(device=z_use.device, dtype=torch.float32).reshape(3)
+    pix_orig = torch.einsum("ij,hwj->hwi", torch.inverse(post_r), pix - post_t)
+    ray_dir = torch.einsum("ij,hwj->hwi", torch.inverse(k_mat), pix_orig)
+    return z_use * torch.linalg.norm(ray_dir, dim=-1)
+
+
+def apply_atmospheric_fog_rgb(rgb, rho, beta, atmospheric_light=FOG_ATMOSPHERIC_LIGHT):
+    """Koschmieder fog on display RGB: ``I t + A (1-t)`` with ``t=exp(-beta rho)``.
+
+    Only RGB is written. ``rho`` must be the optical-path / ray distance.
+
+    Args:
+        rgb: Display RGB ``[3, H, W]`` in ``[0, 1]``.
+        rho: Ray range ``[H, W]`` in meters.
+        beta: Extinction coefficient in 1/m.
+        atmospheric_light: Scalar A in ``[0, 1]``.
+
+    Returns:
+        Fogged RGB ``[3, H, W]`` in ``[0, 1]``.
+    """
+    rgb_ch = rgb[:3].clamp(0.0, 1.0)
+    transmission = torch.exp(-float(beta) * rho.clamp(min=0.0)).clamp(0.0, 1.0)
+    airlight = rgb_ch.new_tensor(float(atmospheric_light))
+    fogged = rgb_ch * transmission.unsqueeze(0) + airlight * (
+        1.0 - transmission.unsqueeze(0)
+    )
+    out = rgb.clone() if torch.is_tensor(rgb) else torch.as_tensor(rgb)
+    out = out.clone()
+    out[:3] = fogged.clamp(0.0, 1.0)
+    return out
 
 def decode_depth_carla(depth_map_ori, to_PIL=True): 
     

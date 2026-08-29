@@ -33,6 +33,9 @@ from opencood.models.gaussian_modules_0822.heatmap.metrics import (
     BACKGROUND_CLASS_ID,
     compute_heatmap_metrics,
 )
+from opencood.models.gaussian_modules_0822.heatmap.box_support import (
+    build_drone_union_target,
+)
 from opencood.models.gaussian_modules_0822.heatmap.target import build_semantic_target
 from opencood.models.gaussian_modules_0822.lss.metrics import compute_depth_metrics
 from opencood.models.gaussian_modules_0822.lss.target import (
@@ -220,16 +223,32 @@ def setup_p1_optimizer(hypes: Dict[str, Any], model: torch.nn.Module) -> torch.o
 def build_heatmap_targets(
     ego: Dict[str, Any],
     predictions: Dict[str, Dict[str, torch.Tensor]],
+    use_drone_box_support: bool = False,
 ) -> Dict[str, torch.Tensor]:
-    """``semantic_target`` per present agent on the 90x160 grid."""
+    """``semantic_target`` per present agent on the 90x160 grid.
+
+    When ``use_drone_box_support`` is True (TRAIN loop only), the drone
+    heatmap target is the binary union of projected official GT boxes and
+    SAM3 ``image_semantic_gts``. Vehicle/RSU always keep SAM3 only.
+    Validation must pass False so val behavior stays production SAM3.
+    """
     targets: Dict[str, torch.Tensor] = {}
     for agent_type, pred in predictions.items():
         logits = pred["heatmap_logits"]
-        cam_inputs = ego[agent_type]["batch_merged_cam_inputs"]
-        target = build_semantic_target(cam_inputs, tau=1)
+        if use_drone_box_support and agent_type == "drone":
+            target = build_drone_union_target(ego, tau=1)
+            target = target.to(device=logits.device)
+        else:
+            cam_inputs = ego[agent_type]["batch_merged_cam_inputs"]
+            target = build_semantic_target(cam_inputs, tau=1)
         if tuple(target.shape[-2:]) != tuple(logits.shape[-2:]):
             raise AssertionError(
                 f"{agent_type} semantic_target {tuple(target.shape)} vs "
+                f"heatmap_logits {tuple(logits.shape)}"
+            )
+        if tuple(target.shape[:1]) != tuple(logits.shape[:1]):
+            raise AssertionError(
+                f"{agent_type} target N={tuple(target.shape)} vs "
                 f"heatmap_logits {tuple(logits.shape)}"
             )
         targets[agent_type] = target
@@ -350,12 +369,15 @@ def _forward_loss_metrics(
     semantic_criterion: GaussianP1SemanticLoss,
     depth_criterion: GaussianP1DepthLoss,
     scaler: Optional[amp.GradScaler],
+    use_drone_box_support: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Dict[str, float]]:
     """One batch: joint predict, two targets, heatmap Focal + depth, metrics."""
     core_model = _unwrap_model(model)
     with amp.autocast(enabled=scaler is not None):
         predictions = model(ego)
-        heatmap_targets = build_heatmap_targets(ego, predictions)
+        heatmap_targets = build_heatmap_targets(
+            ego, predictions, use_drone_box_support=use_drone_box_support
+        )
         depth_targets = build_depth_targets(ego, predictions, core_model)
         heatmap_loss = semantic_criterion(predictions, heatmap_targets)
         depth_loss = depth_criterion(predictions, depth_targets, heatmap_targets)
@@ -426,6 +448,12 @@ def main() -> None:
     hypes["tag"] = opt.tag
     print("load from yaml file: ", opt.hypes_yaml)
     print("P1 mode: joint heatmap + depth (single architecture)")
+    print(
+        "P1 experiment: TRAIN drone heatmap = GT-box OR SAM3; "
+        "L2_hl RGB on TRAIN 2025_05_06_10_01_50 and TEST 2025_05_10_19_54_35; "
+        "TRAIN fog on 40% of non-night timestamps. "
+        "Do not resume a pre-experiment checkpoint as the same run."
+    )
 
     # Build the AirV2X file index before NCCL. parse_seq reads tens of
     # thousands of metadata.pkl files; doing that after the first ALLREDUCE
@@ -505,6 +533,8 @@ def main() -> None:
     for epoch in range(init_epoch, epochs):
         if opt.distributed and isinstance(train_loader.sampler, DistributedSampler):
             train_loader.sampler.set_epoch(epoch)
+        if hasattr(train_dataset, "set_fog_epoch"):
+            train_dataset.set_fog_epoch(epoch)
         print(f"Current learning rate: {optimizer.param_groups[0]['lr']}")
 
         model.train()
@@ -524,7 +554,12 @@ def main() -> None:
             ego = batch_data["ego"]
             ego["epoch"] = epoch
             total_loss, heatmap_loss, depth_loss, metrics = _forward_loss_metrics(
-                model, ego, semantic_criterion, depth_criterion, scaler
+                model,
+                ego,
+                semantic_criterion,
+                depth_criterion,
+                scaler,
+                use_drone_box_support=True,
             )
             if scaler is not None:
                 scaler.scale(total_loss).backward()
