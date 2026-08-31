@@ -1,4 +1,4 @@
-"""Joint R90 P1 frontend: shared 64-ch F90 → HeatmapHead + DepthHead."""
+"""Joint R90 P1 frontend: shared 128-ch F90 → HeatmapHead + DepthHead."""
 
 from __future__ import annotations
 
@@ -24,7 +24,11 @@ from opencood.models.gaussian_modules_0822.lss.head import (
     HeightEmbedding,
     build_depth_heads,
 )
-from opencood.models.gaussian_modules_0822.p1_layout import NUM_CLASSES, expected_feature_hw
+from opencood.models.gaussian_modules_0822.p1_layout import (
+    F90_CHANNELS,
+    NUM_CLASSES,
+    expected_feature_hw,
+)
 
 
 class Airv2xGaussian0822(nn.Module):
@@ -95,10 +99,10 @@ class Airv2xGaussian0822(nn.Module):
             imgs = data_dict[agent_type]["batch_merged_cam_inputs"]["imgs"]
             r2, f45 = self.frontend.extract_backbone_features(agent_type, imgs)
             f90 = self.highres[agent_type](r2, f45)
-            if tuple(f90.shape[1:]) != (64, feat_h, feat_w):
+            if tuple(f90.shape[1:]) != (F90_CHANNELS, feat_h, feat_w):
                 raise AssertionError(
                     f"{agent_type} f90 {tuple(f90.shape)} expected "
-                    f"[N,64,{feat_h},{feat_w}]"
+                    f"[N,{F90_CHANNELS},{feat_h},{feat_w}]"
                 )
             heatmap_logits = self.heatmap_heads[agent_type](f90)
             if tuple(heatmap_logits.shape[-3:]) != (NUM_CLASSES, feat_h, feat_w):

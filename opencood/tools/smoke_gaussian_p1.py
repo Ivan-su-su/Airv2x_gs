@@ -33,7 +33,7 @@ import opencood.pcdet_utils.roiaware_pool3d as _roiaware_pkg
 _roiaware_pkg.roiaware_pool3d_cuda = _cuda_stub
 
 from opencood.hypes_yaml import yaml_utils
-from opencood.models.gaussian_modules_0822.p1_layout import FEAT_H, FEAT_W, NUM_CLASSES
+from opencood.models.gaussian_modules_0822.p1_layout import FEAT_H, FEAT_W, F90_CHANNELS, NUM_CLASSES
 from opencood.tools.train_gaussian_p1 import (
     _forward_loss_metrics,
     _unwrap_model,
@@ -231,30 +231,53 @@ def joint_step(
     depth_criterion: Any,
     device: torch.device,
 ) -> Dict[str, float]:
-    """Shared 64-ch F90; one joint backward; laterals and new DepthHead move."""
+    """Shared 128-ch F90; one joint backward; concat fusion and heads move."""
     core = _unwrap_model(model)
     stats: Dict[str, float] = {}
-    r2_lat = core.highres["vehicle"].r2_lateral
-    f45_lat = core.highres["vehicle"].f45_lateral
-    if float(r2_lat.weight.detach().abs().max()) == 0.0:
-        raise AssertionError("r2_lateral is zero-initialized")
-    if float(f45_lat.weight.detach().abs().max()) == 0.0:
-        raise AssertionError("f45_lateral is zero-initialized")
+    conv1 = core.highres["vehicle"].conv1
+    conv2 = core.highres["vehicle"].conv2
+    if float(conv1.weight.detach().abs().max()) == 0.0:
+        raise AssertionError("concat fusion conv1 is zero-initialized")
+    if float(conv2.weight.detach().abs().max()) == 0.0:
+        raise AssertionError("concat fusion conv2 is zero-initialized")
     imgs = torch.rand(1, 1, 4, 360, 640, device=device)
     with torch.no_grad():
         r2, f45 = core.frontend.extract_backbone_features("vehicle", imgs)
+        f45_up = F.interpolate(
+            f45, size=r2.shape[-2:], mode="bilinear", align_corners=True
+        )
+        fused = torch.cat([r2, f45_up], dim=1)
         f90 = core.highres["vehicle"](r2, f45)
+        heatmap_logits = core.heatmap_heads["vehicle"](f90)
+        depth_logits = core.depth_heads["vehicle"](f90)
     if tuple(r2.shape[1:]) != (24, FEAT_H, FEAT_W):
         raise AssertionError(f"R2 {tuple(r2.shape)} expected [N,24,90,160]")
     if tuple(f45.shape[1:]) != (256, FEAT_H // 2, FEAT_W // 2):
         raise AssertionError(f"F45 {tuple(f45.shape)} expected [N,256,45,80]")
-    if tuple(f90.shape[1:]) != (64, FEAT_H, FEAT_W):
-        raise AssertionError(f"F90 {tuple(f90.shape)} expected [N,64,90,160]")
+    if tuple(f45_up.shape[1:]) != (256, FEAT_H, FEAT_W):
+        raise AssertionError(f"F45_up {tuple(f45_up.shape)} expected [N,256,90,160]")
+    if tuple(fused.shape[1:]) != (280, FEAT_H, FEAT_W):
+        raise AssertionError(f"concat {tuple(fused.shape)} expected [N,280,90,160]")
+    if tuple(f90.shape[1:]) != (F90_CHANNELS, FEAT_H, FEAT_W):
+        raise AssertionError(
+            f"F90 {tuple(f90.shape)} expected [N,{F90_CHANNELS},90,160]"
+        )
+    if tuple(heatmap_logits.shape[1:]) != (NUM_CLASSES, FEAT_H, FEAT_W):
+        raise AssertionError(
+            f"heatmap logits {tuple(heatmap_logits.shape)} expected [N,2,90,160]"
+        )
+    if tuple(depth_logits.shape[1:]) != (50, FEAT_H, FEAT_W):
+        raise AssertionError(
+            f"vehicle depth logits {tuple(depth_logits.shape)} expected [N,50,90,160]"
+        )
     print(
-        f"[shapes] R2={tuple(r2.shape)} F45={tuple(f45.shape)} F90={tuple(f90.shape)} "
+        f"[shapes] R2={tuple(r2.shape)} F45={tuple(f45.shape)} "
+        f"F45_up={tuple(f45_up.shape)} concat={tuple(fused.shape)} "
+        f"F90={tuple(f90.shape)} heatmap={tuple(heatmap_logits.shape)} "
+        f"veh_depth={tuple(depth_logits.shape)} "
         "interp=bilinear align_corners=True"
     )
-    stats["r2_lateral_max_abs"] = float(r2_lat.weight.detach().abs().max())
+    stats["conv1_max_abs"] = float(conv1.weight.detach().abs().max())
 
     model.train()
     core.frontend.assert_train_eval_state(True)
@@ -317,7 +340,7 @@ def joint_step(
             if param.grad is None:
                 raise AssertionError(f"{name} grad is None")
             seen["up2"] = True
-        if "highres.vehicle.r2_lateral" in name or "highres.vehicle.f45_lateral" in name:
+        if "highres.vehicle.conv1" in name or "highres.vehicle.conv2" in name:
             if param.grad is None or float(param.grad.abs().sum()) == 0.0:
                 raise AssertionError(f"{name} got no gradient")
             seen["highres"] = True
@@ -359,13 +382,13 @@ def joint_step(
     if missing:
         raise AssertionError(f"missing joint grads: {missing}")
     print("[grad] joint freeze/trainable contract OK")
-    before = float(core.highres["vehicle"].r2_lateral.weight.detach().abs().sum())
+    before = float(core.highres["vehicle"].conv1.weight.detach().abs().sum())
     optimizer.step()
-    after = float(core.highres["vehicle"].r2_lateral.weight.detach().abs().sum())
+    after = float(core.highres["vehicle"].conv1.weight.detach().abs().sum())
     if after == before:
-        raise AssertionError("r2_lateral did not move after one step")
-    stats["r2_lateral_moved"] = abs(after - before)
-    print(f"[step] r2_lateral moved, abs-sum delta={stats['r2_lateral_moved']:.4e}")
+        raise AssertionError("concat fusion conv1 did not move after one step")
+    stats["conv1_moved"] = abs(after - before)
+    print(f"[step] concat fusion conv1 moved, abs-sum delta={stats['conv1_moved']:.4e}")
     return stats
 
 
@@ -502,7 +525,7 @@ def real_batch_smoke(device: torch.device) -> Dict[str, float]:
         raise FileNotFoundError("no local/dell train split for real-batch smoke")
     hypes["root_dir"] = str(root)
     hypes["validate_dir"] = hypes["root_dir"]
-    dataset = build_dataset(hypes, visualize=False, train=False)
+    dataset = build_dataset(hypes, visualize=False, train=True)
     dataset.pre_processor.preprocess = dummy_lidar_preprocess
     sample = dataset[0]
     batch = dataset.collate_batch_train([sample])
@@ -565,12 +588,6 @@ def real_batch_smoke(device: torch.device) -> Dict[str, float]:
                 f"sem_t={tuple(heatmap_targets[agent].shape)} "
                 f"dep_t={tuple(depth_targets[agent].shape)}"
                 f"{extra}"
-            )
-            total = int(heatmap_targets[agent].numel())
-            fg = int(heatmap_targets[agent].ne(0).sum().item())
-            print(
-                f"[mask] {agent} total={total} fg={fg} frac={fg / max(total, 1):.4f} "
-                f"depth_loss_cells={fg}"
             )
         if "drone" in pred:
             _report_drone_batch(ego, pred, heatmap_targets, depth_targets, core)
@@ -680,29 +697,37 @@ def vehicle_lid_check() -> None:
 
 
 def compute_report() -> None:
-    """Parameter counts and conv MACs for FPN / HeatmapHead / DepthHeads."""
+    """Parameter counts and conv MACs for concat fusion / HeatmapHead / DepthHeads."""
 
     def conv_stats(height: int, width: int, k: int, cin: int, cout: int) -> Tuple[int, int]:
         params = cin * cout * k * k + cout
         macs = height * width * k * k * cin * cout
         return params, macs
 
-    fpn_p, fpn_m = conv_stats(90, 160, 1, 24, 64)
-    p2, m2 = conv_stats(45, 80, 1, 256, 64)
+    old_fpn_p, _ = conv_stats(90, 160, 1, 24, 64)
+    old_p2, _ = conv_stats(45, 80, 1, 256, 64)
+    old_fpn_p += old_p2
+    fpn_p, fpn_m = conv_stats(90, 160, 3, 280, 128)
+    p2, m2 = conv_stats(90, 160, 3, 128, 128)
     fpn_p += p2
     fpn_m += m2
-    hm_p, hm_m = conv_stats(90, 160, 3, 64, 64)
-    p2, m2 = conv_stats(90, 160, 1, 64, 2)
+    print(f"[compute] OLD add-fusion params/agent={old_fpn_p:,}")
+    print(f"[compute] NEW concat-fusion params/agent={fpn_p:,} macs={fpn_m:,}")
+    print(
+        f"[compute] fusion increase/agent={fpn_p - old_fpn_p:,} "
+        f"across_3_agents={3 * (fpn_p - old_fpn_p):,}"
+    )
+    hm_p, hm_m = conv_stats(90, 160, 3, 128, 128)
+    p2, m2 = conv_stats(90, 160, 1, 128, 2)
     hm_p += p2
     hm_m += m2
-    print(f"[compute] shallow FPN params={fpn_p:,} macs={fpn_m:,}")
     print(f"[compute] HeatmapHead params={hm_p:,} macs={hm_m:,}")
     for name, depth_d in (("vehicle", 50), ("rsu", 48)):
-        dp, dm = conv_stats(90, 160, 3, 64, 64)
-        p2, m2 = conv_stats(90, 160, 1, 64, depth_d)
+        dp, dm = conv_stats(90, 160, 3, 128, 128)
+        p2, m2 = conv_stats(90, 160, 1, 128, depth_d)
         print(f"[compute] {name} DepthHead D={depth_d} params={dp + p2:,} macs={dm + m2:,}")
-    dh_p, dh_m = conv_stats(90, 160, 3, 80, 64)
-    p2, m2 = conv_stats(90, 160, 1, 64, 1)
+    dh_p, dh_m = conv_stats(90, 160, 3, 144, 128)
+    p2, m2 = conv_stats(90, 160, 1, 128, 1)
     print(f"[compute] drone DeltaHead params={dh_p + p2:,} macs={dh_m + m2:,}")
     print("[compute] interpolate bilinear align_corners=True has no params")
 

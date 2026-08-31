@@ -56,14 +56,18 @@ def build_depth_class_target(camencode: CamEncode, imgs: torch.Tensor) -> torch.
 
 
 def extract_camera_z_gt(imgs: torch.Tensor) -> torch.Tensor:
-    """Unclamped camera-z at R90 block centers. MAE/RMSE only.
-
-    Args:
-        imgs: Camera tensor with depth channel.
-
-    Returns:
-        ``camera_z_gt`` of shape ``[N, 90, 160]``.
-    """
+    """Unclamped camera-z at R90 block centers."""
     camera_z_full = _camera_z_from_imgs(imgs)
     offset = SPATIAL_STRIDE // 2
     return camera_z_full[:, offset::SPATIAL_STRIDE, offset::SPATIAL_STRIDE]
+
+
+def depth_valid_mask(
+    camera_z: torch.Tensor, d_min: float, d_max: float
+) -> torch.Tensor:
+    """Finite GT depth inside ``[d_min, d_max]``. No objectness."""
+    return (
+        torch.isfinite(camera_z)
+        & (camera_z >= float(d_min))
+        & (camera_z <= float(d_max))
+    )

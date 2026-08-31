@@ -7,24 +7,25 @@ from typing import Any, Dict, Tuple
 import torch
 from torch import nn
 
+from opencood.models.gaussian_modules_0822.p1_layout import F90_CHANNELS
+
 AGENT_TYPES = ("vehicle", "rsu", "drone")
 CATEGORICAL_DEPTH_AGENTS = ("vehicle", "rsu")
 HEIGHT_EMBED_DIM = 16
 HEIGHT_SCALE_M = 100.0
-HEIGHT_SCALE_M = HEIGHT_SCALE_M
 
 
 class DepthHead(nn.Module):
-    """Lightweight depth classifier on 64-channel F90: 3x3 64→64, ReLU, 1x1 64→D.
+    """Lightweight depth classifier on 128-channel F90: 3x3 128→128, ReLU, 1x1 128→D.
 
     No BatchNorm. No extra encoder/FPN. Each agent owns its own head and D.
 
     Args:
         num_bins: Agent-specific depth class count ``D``.
-        in_channels: Shared ``F90`` channels (64).
+        in_channels: Shared ``F90`` channels (128).
     """
 
-    def __init__(self, num_bins: int, in_channels: int = 64) -> None:
+    def __init__(self, num_bins: int, in_channels: int = F90_CHANNELS) -> None:
         super().__init__()
         self.num_bins = int(num_bins)
         self.spatial = nn.Conv2d(in_channels, in_channels, kernel_size=3, padding=1)
@@ -35,7 +36,7 @@ class DepthHead(nn.Module):
         """Predict per-cell depth logits from shared ``F90``.
 
         Args:
-            f90: ``[N, 64, 90, 160]``.
+            f90: ``[N, 128, 90, 160]``.
 
         Returns:
             ``depth_logits`` of shape ``[N, D, 90, 160]``.
@@ -83,16 +84,20 @@ class HeightEmbedding(nn.Module):
 
 
 class DeltaHead(nn.Module):
-    """Height-conditioned residual: concat F90+embed, 3x3 80→64, ReLU, 1x1 64→1.
+    """Height-conditioned residual: concat F90+embed, 3x3 144→128, ReLU, 1x1 128→1.
 
     No BatchNorm. No residual block. No extra tower.
 
     Args:
-        feat_channels: F90 channels (64).
+        feat_channels: F90 channels (128).
         embed_channels: Height embedding channels (16).
     """
 
-    def __init__(self, feat_channels: int = 64, embed_channels: int = HEIGHT_EMBED_DIM) -> None:
+    def __init__(
+        self,
+        feat_channels: int = F90_CHANNELS,
+        embed_channels: int = HEIGHT_EMBED_DIM,
+    ) -> None:
         super().__init__()
         in_channels = int(feat_channels) + int(embed_channels)
         self.spatial = nn.Conv2d(in_channels, feat_channels, kernel_size=3, padding=1)
@@ -103,7 +108,7 @@ class DeltaHead(nn.Module):
         """Predict ``delta`` on the canonical 90x160 grid.
 
         Args:
-            f90: ``[N, 64, 90, 160]``.
+            f90: ``[N, 128, 90, 160]``.
             height_embed: ``[N, 16, 90, 160]``.
 
         Returns:

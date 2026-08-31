@@ -7,22 +7,22 @@ from typing import Any, Dict
 import torch
 from torch import nn
 
-from opencood.models.gaussian_modules_0822.p1_layout import NUM_CLASSES
+from opencood.models.gaussian_modules_0822.p1_layout import F90_CHANNELS, NUM_CLASSES
 
 
 class HeatmapHead(nn.Module):
-    """Lightweight classifier on 64-channel F90: 3x3 64→64, ReLU, 1x1 64→2.
+    """Lightweight classifier on 128-channel F90: 3x3 128→128, ReLU, 1x1 128→2.
 
     No BatchNorm. No extra tower. No residual block. No sigmoid.
 
     Args:
-        in_channels: Shared ``F90`` channels (64).
+        in_channels: Shared ``F90`` channels (128).
         num_classes: Objectness classes including background (0/1).
     """
 
     def __init__(
         self,
-        in_channels: int = 64,
+        in_channels: int = F90_CHANNELS,
         num_classes: int = NUM_CLASSES,
     ) -> None:
         super().__init__()
@@ -38,7 +38,7 @@ class HeatmapHead(nn.Module):
         """Predict per-cell objectness logits from shared ``F90``.
 
         Args:
-            f90: ``[N, 64, 90, 160]``.
+            f90: ``[N, 128, 90, 160]``.
 
         Returns:
             ``heatmap_logits`` of shape ``[N, 2, 90, 160]``.

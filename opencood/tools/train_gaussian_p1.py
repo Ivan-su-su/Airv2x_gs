@@ -40,6 +40,7 @@ from opencood.models.gaussian_modules_0822.heatmap.target import build_semantic_
 from opencood.models.gaussian_modules_0822.lss.metrics import compute_depth_metrics
 from opencood.models.gaussian_modules_0822.lss.target import (
     build_depth_class_target,
+    depth_valid_mask,
     extract_camera_z_gt,
 )
 from opencood.tools import multi_gpu_utils, train_utils
@@ -298,6 +299,22 @@ def build_depth_targets(
     return targets
 
 
+def build_depth_valid_masks(
+    ego: Dict[str, Any],
+    predictions: Dict[str, Dict[str, torch.Tensor]],
+    core_model: torch.nn.Module,
+) -> Dict[str, torch.Tensor]:
+    """In-range GT depth masks for vehicle/RSU. Drone is skipped."""
+    masks: Dict[str, torch.Tensor] = {}
+    for agent_type in predictions:
+        if agent_type == "drone":
+            continue
+        enc = core_model.frontend.encoders[agent_type]
+        z = extract_camera_z_gt(ego[agent_type]["batch_merged_cam_inputs"]["imgs"])
+        masks[agent_type] = depth_valid_mask(z, enc.d_min, enc.d_max)
+    return masks
+
+
 def compute_p1_metrics(
     ego: Dict[str, Any],
     predictions: Dict[str, Dict[str, torch.Tensor]],
@@ -341,12 +358,7 @@ def compute_p1_metrics(
             if agent_type == "drone" and "delta_pred" in pred:
                 height = pred["camera_world_z"].detach().reshape(-1, 1, 1)
                 delta_gt = camera_z_gt - height
-                valid = (
-                    torch.isfinite(camera_z_gt)
-                    & (camera_z_gt >= d_min)
-                    & (camera_z_gt <= d_max)
-                    & foreground_mask
-                )
+                valid = depth_valid_mask(camera_z_gt, d_min, d_max) & foreground_mask
                 if int(valid.sum().item()) > 0:
                     agent_depth["delta_mae_fg"] = float(
                         (pred["delta_pred"].detach()[valid] - delta_gt[valid])
@@ -379,8 +391,11 @@ def _forward_loss_metrics(
             ego, predictions, use_drone_box_support=use_drone_box_support
         )
         depth_targets = build_depth_targets(ego, predictions, core_model)
+        depth_valid_masks = build_depth_valid_masks(ego, predictions, core_model)
         heatmap_loss = semantic_criterion(predictions, heatmap_targets)
-        depth_loss = depth_criterion(predictions, depth_targets, heatmap_targets)
+        depth_loss = depth_criterion(
+            predictions, depth_targets, heatmap_targets, depth_valid_masks
+        )
         total_loss = heatmap_loss + depth_loss
     metrics = compute_p1_metrics(ego, predictions, heatmap_targets, core_model)
     metrics.update(depth_criterion.loss_dict)
@@ -493,7 +508,7 @@ def main() -> None:
             model,
             device_ids=[opt.gpu],
             output_device=opt.gpu,
-            find_unused_parameters=True,
+            find_unused_parameters=False,
         )
 
     semantic_criterion, depth_criterion = build_p1_criteria(hypes)

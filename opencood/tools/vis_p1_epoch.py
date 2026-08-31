@@ -134,9 +134,9 @@ def inspect_weights(path: str, out_json: Path) -> Dict[str, Any]:
         "up2_first": "frontend.encoders.{a}.up2.conv.0.weight",
         "depth_head": "depth_heads.{a}.pred.weight",
         "heatmap_cls": "heatmap_heads.{a}.cls.weight",
-        "r2_lateral": "highres.{a}.r2_lateral.weight",
-        "r2_lateral_bias": "highres.{a}.r2_lateral.bias",
-        "f45_lateral": "highres.{a}.f45_lateral.weight",
+        "conv1": "highres.{a}.conv1.weight",
+        "conv1_bias": "highres.{a}.conv1.bias",
+        "conv2": "highres.{a}.conv2.weight",
     }
     for label, template in named.items():
         tensors = {}
@@ -153,7 +153,7 @@ def inspect_weights(path: str, out_json: Path) -> Dict[str, Any]:
         pair["abs_mean"] = {
             agent: round(float(t.detach().float().abs().mean()), 6) for agent, t in tensors.items()
         }
-        if label == "r2_lateral":
+        if label == "conv1":
             pair["max_abs"] = {
                 agent: round(float(t.detach().float().abs().max()), 6) for agent, t in tensors.items()
             }
