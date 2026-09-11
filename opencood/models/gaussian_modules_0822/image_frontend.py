@@ -105,6 +105,24 @@ def present_camera_agents(ego_batch: Mapping[str, Any]) -> List[str]:
     return present
 
 
+def p1_agent_predictions(predictions: Mapping[str, Any]) -> Dict[str, Any]:
+    """Keep per-agent P1 dicts from a mixed model output.
+
+    Detection tensors (``psm`` / ``rm`` / ``obj``) are dropped.
+
+    Args:
+        predictions: ``Airv2xGaussian0822`` forward output.
+
+    Returns:
+        ``{agent: p1_dict}`` for agents present in ``predictions``.
+    """
+    return {
+        agent: predictions[agent]
+        for agent in AGENT_TYPES
+        if agent in predictions
+    }
+
+
 def _is_norm(module: nn.Module) -> bool:
     """True if ``module`` is a BatchNorm family layer."""
     return isinstance(module, _BN_TYPES)
@@ -137,6 +155,157 @@ def _camencode_r2_and_f45(
     return r2, x
 
 
+def freeze_efficientnet_bn(trunk: nn.Module) -> None:
+    """Keep EfficientNet BN in eval with frozen affine and running stats."""
+    for module in trunk.modules():
+        if not _is_norm(module):
+            continue
+        module.eval()
+        for param in module.parameters():
+            param.requires_grad = False
+
+
+def build_camencode(cam_cfg: Mapping[str, Any], agent_type: str) -> CamEncode:
+    """Construct official CamEncode. ``use_depth_gt`` must stay false.
+
+    Args:
+        cam_cfg: Per-agent ``model.args.<agent>.cam`` dict.
+        agent_type: Agent name used only in error messages.
+
+    Returns:
+        Official ``CamEncode`` with ImageNet EfficientNet-B0.
+    """
+    grid_conf = cam_cfg["grid_conf"]
+    ddiscr = list(grid_conf["ddiscr"])
+    use_gt_depth = bool(cam_cfg.get("use_depth_gt", False))
+    if use_gt_depth:
+        raise ValueError(
+            f"{agent_type} requires cam.use_depth_gt=false so official "
+            "depth_head exists (unused by P1). Do not silently override yaml."
+        )
+    downsample = int(cam_cfg["img_downsample"])
+    if downsample != 8:
+        raise ValueError(
+            f"{agent_type} img_downsample must be 8 to keep official up2/F45, "
+            f"got {downsample}"
+        )
+    return CamEncode(
+        D=int(ddiscr[2]),
+        C=int(cam_cfg["img_features"]),
+        downsample=downsample,
+        ddiscr=ddiscr,
+        mode=str(grid_conf["mode"]),
+        use_gt_depth=False,
+        depth_supervision=bool(cam_cfg.get("depth_supervision", True)),
+    )
+
+
+def configure_camencode_trainable_state(encoder: CamEncode) -> None:
+    """Fine-tune non-BN trunk; freeze EfficientNet BN and official heads."""
+    for param in encoder.trunk.parameters():
+        param.requires_grad = True
+    freeze_efficientnet_bn(encoder.trunk)
+    for unused_name in ("_conv_head", "_fc"):
+        unused = getattr(encoder.trunk, unused_name, None)
+        if unused is None:
+            continue
+        for param in unused.parameters():
+            param.requires_grad = False
+    for name in _OFFICIAL_UNUSED_HEADS:
+        module = getattr(encoder, name, None)
+        if module is None:
+            continue
+        module.eval()
+        for param in module.parameters():
+            param.requires_grad = False
+    for name in ("up1", "up2"):
+        module = getattr(encoder, name, None)
+        if module is None:
+            raise RuntimeError(f"CamEncode missing trainable module {name}")
+        for param in module.parameters():
+            param.requires_grad = True
+
+
+def apply_camencode_train_eval_state(encoder: CamEncode, mode: bool) -> None:
+    """Set train/eval without putting EfficientNet BN into train.
+
+    ``CamEncode.training`` follows ``mode`` so
+    ``bin_depths(..., target=camencode.training)`` keeps official
+    train-time bin clamping. EfficientNet BN stays eval. Official unused
+    heads stay eval. up1/up2 (including their BN) follow ``mode``.
+
+    Args:
+        encoder: One official ``CamEncode``.
+        mode: ``True`` for train, ``False`` for eval.
+    """
+    encoder.train(mode)
+    for name in _OFFICIAL_UNUSED_HEADS:
+        module = getattr(encoder, name, None)
+        if module is not None:
+            module.eval()
+    freeze_efficientnet_bn(encoder.trunk)
+    for name in ("up1", "up2"):
+        getattr(encoder, name).train(mode)
+
+
+def assert_camencode_train_eval_state(
+    encoder: CamEncode, mode: bool, agent_type: str
+) -> None:
+    """Assert BN-freeze / fine-tune contract after ``train()`` / ``eval()``.
+
+    Args:
+        encoder: One official ``CamEncode``.
+        mode: Current training flag of the parent model.
+        agent_type: Agent name used only in error messages.
+    """
+    if bool(encoder.training) != bool(mode):
+        raise AssertionError(
+            f"{agent_type} CamEncode.training={encoder.training} expected {mode}"
+        )
+    for name in _OFFICIAL_UNUSED_HEADS:
+        module = getattr(encoder, name, None)
+        if module is None:
+            continue
+        if module.training:
+            raise AssertionError(
+                f"{agent_type}.{name}.training={module.training} expected False"
+            )
+        if any(param.requires_grad for param in module.parameters()):
+            raise AssertionError(f"{agent_type}.{name} still requires_grad")
+    for module in encoder.trunk.modules():
+        if not _is_norm(module):
+            continue
+        if module.training:
+            raise AssertionError(f"{agent_type} EfficientNet BN still in train mode")
+        if any(param.requires_grad for param in module.parameters()):
+            raise AssertionError(
+                f"{agent_type} EfficientNet BN affine still trainable"
+            )
+    encoder_trainable = any(
+        param.requires_grad
+        for name, param in encoder.named_parameters()
+        if name.startswith(("trunk.", "up1.", "up2."))
+    )
+    if mode and encoder_trainable:
+        n_trainable_trunk = sum(
+            1 for param in encoder.trunk.parameters() if param.requires_grad
+        )
+        if n_trainable_trunk == 0:
+            raise AssertionError(
+                f"{agent_type} EfficientNet non-BN trunk has no trainable params"
+            )
+    for name in ("up1", "up2"):
+        module = getattr(encoder, name)
+        if bool(module.training) != bool(mode):
+            raise AssertionError(
+                f"{agent_type}.{name}.training={module.training} expected {mode}"
+            )
+        if encoder_trainable and not all(
+            param.requires_grad for param in module.parameters()
+        ):
+            raise AssertionError(f"{agent_type}.{name} is not fully trainable")
+
+
 class ImageFrontend(nn.Module):
     """Three independent official ``CamEncode`` modules.
 
@@ -166,67 +335,12 @@ class ImageFrontend(nn.Module):
 
     def _build_camencode(self, agent_type: str) -> CamEncode:
         """Construct official CamEncode. ``use_depth_gt`` must stay false."""
-        cam_cfg = self.model_cfg[agent_type]["cam"]
-        grid_conf = cam_cfg["grid_conf"]
-        ddiscr = list(grid_conf["ddiscr"])
-        use_gt_depth = bool(cam_cfg.get("use_depth_gt", False))
-        if use_gt_depth:
-            raise ValueError(
-                f"{agent_type} requires cam.use_depth_gt=false so official "
-                "depth_head exists (unused by P1). Do not silently override yaml."
-            )
-        downsample = int(cam_cfg["img_downsample"])
-        if downsample != 8:
-            raise ValueError(
-                f"{agent_type} img_downsample must be 8 to keep official up2/F45, "
-                f"got {downsample}"
-            )
-        encoder = CamEncode(
-            D=int(ddiscr[2]),
-            C=int(cam_cfg["img_features"]),
-            downsample=downsample,
-            ddiscr=ddiscr,
-            mode=str(grid_conf["mode"]),
-            use_gt_depth=False,
-            depth_supervision=bool(cam_cfg.get("depth_supervision", True)),
-        )
-        return encoder
-
-    def _freeze_efficientnet_bn(self, trunk: nn.Module) -> None:
-        """Keep EfficientNet BN in eval with frozen affine and running stats."""
-        for module in trunk.modules():
-            if not _is_norm(module):
-                continue
-            module.eval()
-            for param in module.parameters():
-                param.requires_grad = False
+        return build_camencode(self.model_cfg[agent_type]["cam"], agent_type)
 
     def _configure_trainable_state(self) -> None:
         """Fine-tune non-BN trunk; freeze EfficientNet BN and official heads."""
         for encoder in self.encoders.values():
-            for param in encoder.trunk.parameters():
-                param.requires_grad = True
-            self._freeze_efficientnet_bn(encoder.trunk)
-            # ImageNet classifier tail is unused by CamEncode feature extraction.
-            for unused_name in ("_conv_head", "_fc"):
-                unused = getattr(encoder.trunk, unused_name, None)
-                if unused is None:
-                    continue
-                for param in unused.parameters():
-                    param.requires_grad = False
-            for name in _OFFICIAL_UNUSED_HEADS:
-                module = getattr(encoder, name, None)
-                if module is None:
-                    continue
-                module.eval()
-                for param in module.parameters():
-                    param.requires_grad = False
-            for name in ("up1", "up2"):
-                module = getattr(encoder, name, None)
-                if module is None:
-                    raise RuntimeError(f"CamEncode missing trainable module {name}")
-                for param in module.parameters():
-                    param.requires_grad = True
+            configure_camencode_trainable_state(encoder)
 
     def apply_train_eval_state(self, mode: bool) -> None:
         """Set train/eval without putting the whole EfficientNet trunk in eval.
@@ -240,14 +354,7 @@ class ImageFrontend(nn.Module):
             mode: ``True`` for train, ``False`` for eval.
         """
         for encoder in self.encoders.values():
-            encoder.train(mode)
-            for name in _OFFICIAL_UNUSED_HEADS:
-                module = getattr(encoder, name, None)
-                if module is not None:
-                    module.eval()
-            self._freeze_efficientnet_bn(encoder.trunk)
-            for name in ("up1", "up2"):
-                getattr(encoder, name).train(mode)
+            apply_camencode_train_eval_state(encoder, mode)
 
     def assert_train_eval_state(self, mode: bool) -> None:
         """Assert BN-freeze / fine-tune contract after ``model.train()`` / ``eval()``.
@@ -256,47 +363,7 @@ class ImageFrontend(nn.Module):
             mode: Current training flag of the parent model.
         """
         for agent_type, encoder in self.encoders.items():
-            if bool(encoder.training) != bool(mode):
-                raise AssertionError(
-                    f"{agent_type} CamEncode.training={encoder.training} expected {mode}"
-                )
-            for name in _OFFICIAL_UNUSED_HEADS:
-                module = getattr(encoder, name, None)
-                if module is None:
-                    continue
-                if module.training:
-                    raise AssertionError(
-                        f"{agent_type}.{name}.training={module.training} expected False"
-                    )
-                if any(param.requires_grad for param in module.parameters()):
-                    raise AssertionError(f"{agent_type}.{name} still requires_grad")
-            for module in encoder.trunk.modules():
-                if not _is_norm(module):
-                    continue
-                if module.training:
-                    raise AssertionError(
-                        f"{agent_type} EfficientNet BN still in train mode"
-                    )
-                if any(param.requires_grad for param in module.parameters()):
-                    raise AssertionError(
-                        f"{agent_type} EfficientNet BN affine still trainable"
-                    )
-            if mode:
-                n_trainable_trunk = sum(
-                    1 for param in encoder.trunk.parameters() if param.requires_grad
-                )
-                if n_trainable_trunk == 0:
-                    raise AssertionError(
-                        f"{agent_type} EfficientNet non-BN trunk has no trainable params"
-                    )
-            for name in ("up1", "up2"):
-                module = getattr(encoder, name)
-                if bool(module.training) != bool(mode):
-                    raise AssertionError(
-                        f"{agent_type}.{name}.training={module.training} expected {mode}"
-                    )
-                if not all(param.requires_grad for param in module.parameters()):
-                    raise AssertionError(f"{agent_type}.{name} is not fully trainable")
+            assert_camencode_train_eval_state(encoder, mode, agent_type)
 
     def extract_backbone_features(
         self, agent_type: str, imgs: torch.Tensor

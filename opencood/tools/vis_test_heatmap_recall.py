@@ -41,7 +41,7 @@ from opencood.models.gaussian_modules_0822.heatmap.metrics import (
 from opencood.models.gaussian_modules_0822.heatmap.target import binary_objectness_target
 from opencood.models.gaussian_modules_0822.image_frontend import present_camera_agents
 from opencood.tools import train_utils
-from opencood.tools.eval_gaussian_p1 import denormalize_rgb, load_epoch_checkpoint
+from opencood.tools.eval_gaussian_p1 import denormalize_rgb
 from opencood.tools.train_gaussian_p1 import _unwrap_model
 from opencood.utils.box_utils import boxes_to_corners_3d
 
@@ -58,8 +58,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--hypes_yaml", "-y", required=True)
     parser.add_argument("--model_dir", required=True)
     parser.add_argument("--epoch", type=int, default=9)
+    parser.add_argument(
+        "--ckpt",
+        default="",
+        help="Checkpoint filename or path. Overrides --epoch if set.",
+    )
     parser.add_argument("--gpu_id", type=int, default=0)
-    parser.add_argument("--frames_per_scene", type=int, default=5)
+    parser.add_argument("--frames_per_scene", type=int, default=3)
+    parser.add_argument("--foggy_frames", type=int, default=10)
+    parser.add_argument("--foggy_scene", default="2025_05_05_23_26_24")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--fg_tau", type=float, default=PRIMARY_OBJECTNESS_THRESHOLD)
     parser.add_argument(
@@ -104,8 +111,14 @@ def scene_from_path(path: Any) -> str:
     return match.group(0) if match else "unknown"
 
 
-def sample_plan(dataset: Any, frames_per_scene: int, seed: int) -> List[Tuple[str, int]]:
-    """Random ``frames_per_scene`` indices per scenario, sorted within scene."""
+def sample_plan(
+    dataset: Any,
+    frames_per_scene: int,
+    seed: int,
+    foggy_frames: int = 10,
+    foggy_scene: str = "2025_05_05_23_26_24",
+) -> List[Tuple[str, int]]:
+    """Random frames per scenario; foggy scene uses ``foggy_frames``."""
     rng = np.random.RandomState(int(seed))
     plan: List[Tuple[str, int]] = []
     for scene_i, end in enumerate(dataset.len_record):
@@ -115,11 +128,43 @@ def sample_plan(dataset: Any, frames_per_scene: int, seed: int) -> List[Tuple[st
         ts0 = dataset.return_timestamp_key(scene_db, 0)
         scene = scene_from_path(first_cav[ts0]["metadata_path"])
         n = int(end) - start
-        k = min(int(frames_per_scene), n)
+        k_want = int(foggy_frames) if scene == foggy_scene else int(frames_per_scene)
+        k = min(k_want, n)
         chosen = rng.choice(n, size=k, replace=False)
         for local in sorted(int(x) for x in chosen):
             plan.append((scene, start + local))
     return plan
+
+
+def resolve_ckpt_path(model_dir: str, epoch: int, ckpt: str) -> Path:
+    """Return ``--ckpt`` if given, else ``net_epoch{epoch}.pth`` under model_dir."""
+    if ckpt:
+        path = Path(ckpt)
+        if not path.is_file():
+            path = Path(model_dir) / ckpt
+        if not path.is_file():
+            raise FileNotFoundError(ckpt)
+        return path
+    path = Path(model_dir) / f"net_epoch{epoch}.pth"
+    if not path.is_file():
+        raise FileNotFoundError(path)
+    return path
+
+
+def load_ckpt_file(model: torch.nn.Module, path: Path) -> None:
+    """Load ``model_state_dict`` from a P1 checkpoint file."""
+    raw = torch.load(str(path), map_location="cpu")
+    state = (
+        raw["model_state_dict"]
+        if isinstance(raw, dict) and "model_state_dict" in raw
+        else raw
+    )
+    missing, unexpected = model.load_state_dict(state, strict=True)
+    print(f"Loaded {path}")
+    if missing:
+        print("missing", missing)
+    if unexpected:
+        print("unexpected", unexpected)
 
 
 def paint_agent_box_maps(ego: Mapping[str, Any], agent_type: str) -> torch.Tensor:
@@ -290,20 +335,29 @@ def main() -> None:
 
     print("Building test dataset...")
     dataset = build_dataset(hypes, visualize=False, train=False)
-    plan = sample_plan(dataset, opt.frames_per_scene, opt.seed)
+    plan = sample_plan(
+        dataset,
+        opt.frames_per_scene,
+        opt.seed,
+        foggy_frames=opt.foggy_frames,
+        foggy_scene=opt.foggy_scene,
+    )
     print(
         f"test n={len(dataset)} scenes={len(dataset.len_record)} "
-        f"sampled={len(plan)} seed={opt.seed}"
+        f"sampled={len(plan)} seed={opt.seed} "
+        f"frames={opt.frames_per_scene} foggy={opt.foggy_frames}"
     )
 
+    ckpt_path = resolve_ckpt_path(opt.model_dir, opt.epoch, opt.ckpt)
     model = train_utils.create_model(hypes)
-    load_epoch_checkpoint(model, opt.model_dir, opt.epoch)
+    load_ckpt_file(model, ckpt_path)
     model.to(device)
     model.eval()
     _unwrap_model(model)
     fg_tau = float(opt.fg_tau)
     out_root = Path(opt.out_root)
-    vis_dir = out_root / f"epoch{opt.epoch}"
+    vis_tag = ckpt_path.stem
+    vis_dir = out_root / vis_tag
     vis_dir.mkdir(parents=True, exist_ok=True)
 
     pixel_tp: Dict[str, float] = defaultdict(float)
@@ -372,7 +426,7 @@ def main() -> None:
                 rgb = denormalize_rgb(imgs[view])
                 out_png = vis_dir / scene / agent / f"{sample_i:02d}_{idx:04d}.png"
                 title = (
-                    f"test ep{opt.epoch} {scene} idx={idx} {agent} view={view}  "
+                    f"test {ckpt_path.name} {scene} idx={idx} {agent} view={view}  "
                     f"recall={recall:.3f} prec={precision:.3f}  "
                     f"gt_n={n_gt} pred_n={n_pred} tau={fg_tau:g}"
                 )
@@ -426,10 +480,12 @@ def main() -> None:
             for agent in AGENT_ORDER
         }
     report = {
-        "checkpoint": f"net_epoch{opt.epoch}.pth",
+        "checkpoint": ckpt_path.name,
         "split": "test",
         "n_scenes": len(scenes),
         "frames_per_scene": int(opt.frames_per_scene),
+        "foggy_frames": int(opt.foggy_frames),
+        "foggy_scene": opt.foggy_scene,
         "seed": int(opt.seed),
         "fg_tau": fg_tau,
         "gt": "official 3D GT boxes projected to each agent camera, tau=1 R90",
@@ -439,12 +495,13 @@ def main() -> None:
         "plan": [{"scene": s, "idx": i} for s, i in plan],
         "rows": rows,
     }
-    out_json = out_root / f"epoch{opt.epoch}_metrics.json"
-    out_txt = out_root / f"epoch{opt.epoch}_metrics.txt"
+    out_json = out_root / f"{vis_tag}_metrics.json"
+    out_txt = out_root / f"{vis_tag}_metrics.txt"
     out_json.write_text(json.dumps(report, indent=2))
     lines = [
-        f"test heatmap recall  epoch={opt.epoch}  scenes={len(scenes)}  "
-        f"{opt.frames_per_scene}/scene  seed={opt.seed}  tau={fg_tau:g}",
+        f"test heatmap recall  ckpt={ckpt_path.name}  scenes={len(scenes)}  "
+        f"{opt.frames_per_scene}/scene foggy={opt.foggy_frames}  "
+        f"seed={opt.seed}  tau={fg_tau:g}",
         "GT = projected official 3D boxes (test has no SAM3). recall = covered GT pixels.",
         "",
         f"{'agent':8s}  {'recall':>8s}  {'prec':>8s}  {'gt_px':>10s}  {'pred_px':>10s}  frames  emptyGT",

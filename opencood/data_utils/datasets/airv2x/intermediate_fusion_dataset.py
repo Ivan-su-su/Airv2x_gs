@@ -161,6 +161,8 @@ class IntermediateFusionDatasetAirv2x(basedataset.BaseDataset):
             meta_path = self._metadata_path_for_idx(idx)
             if camera_utils.is_l2_train_night_scenario(meta_path, True):
                 continue
+            if camera_utils.is_real_fog_scenario(meta_path, True):
+                continue
             self._fog_eligible.append(idx)
         try:
             self._fog_epoch_buf.share_memory_()

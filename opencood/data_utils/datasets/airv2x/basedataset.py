@@ -160,6 +160,20 @@ class BaseDataset(Dataset):
                 if os.path.isdir(os.path.join(root_dir, x))
             ]
         )
+        self._scene_keep = {}
+        if self.train:
+            for item in params.get("extra_train_scenes") or []:
+                extra_path = item["path"] if isinstance(item, dict) else item
+                if extra_path not in scenario_folders:
+                    scenario_folders.append(extra_path)
+                if isinstance(item, dict) and (
+                    float(item.get("keep_frac", 1.0)) < 1.0
+                    or int(item.get("stride", 1)) > 1
+                ):
+                    self._scene_keep[os.path.basename(extra_path.rstrip("/"))] = (
+                        float(item.get("keep_frac", 1.0)),
+                        int(item.get("stride", 1)),
+                    )
         scenario_folders_name = sorted(
             [
                 x
@@ -173,9 +187,9 @@ class BaseDataset(Dataset):
         self.ego_type = params.get("ego_type", "vehicle")
         assert self.ego_type in ["vehicle", "rsu", "drone"], f"ego type {self.ego_type} not supported"
 
-        index_signature = tuple(
+        folder_sig = tuple(
             (
-                os.path.basename(folder),
+                os.path.basename(folder.rstrip("/")),
                 sum(
                     1
                     for name in os.listdir(folder)
@@ -184,10 +198,14 @@ class BaseDataset(Dataset):
             )
             for folder in scenario_folders
         )
-        cache_path = os.path.join(
-            root_dir,
-            f".airv2x_index_{'train' if train else 'val'}_{self.ego_type}.pkl",
-        )
+        if self._scene_keep:
+            index_signature = (folder_sig, tuple(sorted(self._scene_keep.items())))
+        else:
+            index_signature = folder_sig
+        cache_name = f".airv2x_index_{'train' if train else 'val'}_{self.ego_type}"
+        if self._scene_keep:
+            cache_name += "_fogmix"
+        cache_path = os.path.join(root_dir, cache_name + ".pkl")
         loaded = self._try_load_scenario_index(cache_path, index_signature)
         if loaded is None:
             lock_path = cache_path + ".lock"
@@ -237,6 +255,12 @@ class BaseDataset(Dataset):
             )
         ):
             scenario_dict = parse_seq(scenario_folder)
+            scene_name = os.path.basename(scenario_folder.rstrip("/"))
+            if scene_name in self._scene_keep:
+                keep_frac, stride = self._scene_keep[scene_name]
+                scenario_dict = self._subsample_scenario_timestamps(
+                    scenario_dict, scene_name, keep_frac, stride
+                )
             scenario_database[i] = scenario_dict
             while True:
                 first = list(scenario_database[i].keys())[0]
@@ -252,6 +276,23 @@ class BaseDataset(Dataset):
                         len_record.append(len_record[-1] + record_length)
                     break
         return scenario_database, len_record
+
+    @staticmethod
+    def _subsample_scenario_timestamps(scenario_dict, scene_name, keep_frac, stride):
+        """Keep ``keys[:round(frac*N)][::stride]``; used to mix a TEST scene."""
+        first = next(iter(scenario_dict.values()))
+        keys = list(first.keys())
+        n_pool = max(1, int(round(float(keep_frac) * len(keys))))
+        keep = set(keys[:n_pool][:: max(int(stride), 1)])
+        for agent_id in scenario_dict:
+            for ts in list(scenario_dict[agent_id].keys()):
+                if ts not in keep:
+                    del scenario_dict[agent_id][ts]
+        print(
+            "[dataset] %s subsample %d -> %d timestamps (frac=%s stride=%s)"
+            % (scene_name, len(keys), len(keep), keep_frac, stride)
+        )
+        return scenario_dict
 
     @staticmethod
     def _try_load_scenario_index(cache_path, signature):

@@ -5,6 +5,7 @@
 # License: TDG-Attribution-NonCommercial-NoDistrib
 
 import argparse
+import math
 import os
 import re
 import statistics
@@ -15,7 +16,15 @@ from typing import Any, Dict, List, Optional, Tuple
 import torch, resource
 import torch.distributed as dist
 torch.multiprocessing.set_sharing_strategy('file_system')
-resource.setrlimit(resource.RLIMIT_NOFILE, (4096, 4096))
+# Raise the soft fd cap toward the hard limit. Never lower the hard cap:
+# the old (4096, 4096) permanently capped this process and P1 DDP then
+# died around iter 59 with NFS ``Errno 5`` while decoding depth PNGs.
+_soft, _hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+if _hard == resource.RLIM_INFINITY or _hard < 0:
+    _new_soft = max(_soft, 65536)
+else:
+    _new_soft = min(_hard, max(_soft, min(65536, _hard)))
+resource.setrlimit(resource.RLIMIT_NOFILE, (_new_soft, _hard))
 from torch.cuda import amp
 from tensorboardX import SummaryWriter
 from torch.utils.data import DataLoader, DistributedSampler
@@ -27,22 +36,6 @@ sys.path.append(str(root_path))
 import opencood.hypes_yaml.yaml_utils as yaml_utils
 from opencood.data_utils.datasets import build_dataset
 from opencood.tools import multi_gpu_utils, train_utils
-
-import torch.utils.checkpoint as _cp
-import traceback
-
-_old_ckpt = _cp.checkpoint
-
-def checkpoint_trace(function, *args, **kwargs):
-    # 只要没显式传 use_reentrant，就说明是你现在 warning 的来源
-    if "use_reentrant" not in kwargs:
-        print("\n[CKPT WARNING SOURCE] checkpoint called WITHOUT use_reentrant. stack:")
-        traceback.print_stack(limit=30)
-        # 强制变成 False（避免默认 reentrant）
-        kwargs["use_reentrant"] = False
-    return _old_ckpt(function, *args, **kwargs)
-
-_cp.checkpoint = checkpoint_trace
 
 def train_parser():
     """
@@ -343,11 +336,11 @@ def main():
     visualize_mode = hypes.get("visualize", False)
    
     train_dataset = build_dataset(hypes, visualize=visualize_mode, train=True)
-    # val_dataset = build_dataset(hypes, visualize=visualize_mode, train=False)
+    val_dataset = build_dataset(hypes, visualize=visualize_mode, train=False)
     
     # Create dataloaders
     train_loader = setup_dataloader(train_dataset, hypes, opt, is_train=True)
-    # val_loader = setup_dataloader(val_dataset, hypes, opt, is_train=False)
+    val_loader = setup_dataloader(val_dataset, hypes, opt, is_train=False)
     
     # Create model
     print("Creating model...")
@@ -438,6 +431,9 @@ def main():
         pbar = tqdm(enumerate(train_loader),
                     total=len(train_loader),
                     disable=not main_process)
+        n_clip = 0
+        n_step = 0
+        n_nonfinite_grad = 0
         for i, batch_data in pbar:
             if batch_data is None:
                 continue
@@ -493,15 +489,27 @@ def main():
                 
                 # 前向传播后也清理一下显存
                 torch.cuda.empty_cache()
-            torch.autograd.set_detect_anomaly(True)
-            # Backward pass with mixed precision support
             if scaler is not None:
                 scaler.scale(loss).backward()
+                scaler.unscale_(optimizer)
+                grad_norm = torch.nn.utils.clip_grad_norm_(
+                    model.parameters(), max_norm=1.0
+                )
                 scaler.step(optimizer)
                 scaler.update()
             else:
                 loss.backward()
+                grad_norm = torch.nn.utils.clip_grad_norm_(
+                    model.parameters(), max_norm=1.0
+                )
                 optimizer.step()
+            if main_process and grad_norm is not None:
+                gn = float(grad_norm)
+                if math.isfinite(gn):
+                    n_step += 1
+                    n_clip += int(gn > 1.0)
+                else:
+                    n_nonfinite_grad += 1
             
             # Update progress bar
             print_msg = None
@@ -518,6 +526,16 @@ def main():
             if main_process:
                 with open(os.path.join(saved_path, "train_loss.txt"), "a+") as f:
                     f.write(f"Epoch[{epoch}], iter[{i}/{len(train_loader)}], loss[{loss.item():.4f}]\n")
+
+        if main_process and n_step:
+            clip_rate = n_clip / n_step
+            with open(os.path.join(saved_path, "grad_clip.txt"), "a+") as f:
+                f.write(
+                    f"Epoch[{epoch}], steps[{n_step}], clipped[{n_clip}], "
+                    f"clip_rate[{clip_rate:.4f}], nonfinite[{n_nonfinite_grad}]\n"
+                )
+            print(f"Epoch {epoch}: grad clip rate {clip_rate:.3f} "
+                  f"({n_clip}/{n_step}), nonfinite {n_nonfinite_grad}")
                     
         if opt.distributed:
             torch.cuda.synchronize()             

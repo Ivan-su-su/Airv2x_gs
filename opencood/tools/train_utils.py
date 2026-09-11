@@ -467,17 +467,37 @@ def setup_optimizer(hypes, model):
         The training configurations.
     model : opencood model
         The pytorch model
+
+    Returns
+    -------
+    optimizer : torch.optim
+        Decay group holds ordinary Linear / Conv weights; normalization
+        parameters (any 1-D affine, e.g. LayerNorm / LayerScale) and all
+        biases go to the no-decay group.
     """
     method_dict = hypes["optimizer"]
     optimizer_method = getattr(optim, method_dict["core_method"], None)
     if not optimizer_method:
         raise ValueError("{} is not supported".format(method_dict["name"]))
-    if "args" in method_dict:
-        return optimizer_method(
-            model.parameters(), lr=method_dict["lr"], **method_dict["args"]
-        )
-    else:
-        return optimizer_method(model.parameters(), lr=method_dict["lr"])
+    decay = []
+    no_decay = []
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        if param.ndim <= 1 or name.endswith(".bias"):
+            no_decay.append(param)
+        else:
+            decay.append(param)
+    extra = dict(method_dict.get("args") or {})
+    weight_decay = float(extra.pop("weight_decay", 0.0))
+    groups = []
+    if decay:
+        groups.append({"params": decay, "weight_decay": weight_decay})
+    if no_decay:
+        groups.append({"params": no_decay, "weight_decay": 0.0})
+    if not groups:
+        raise ValueError("optimizer has no trainable parameters")
+    return optimizer_method(groups, lr=method_dict["lr"], **extra)
 
 
 def setup_lr_schedular(hypes, optimizer, init_epoch=None, n_iter_per_epoch=None):

@@ -17,49 +17,61 @@ from opencood.models.gaussian_modules_0822.p1_layout import BLOCK
 def binary_objectness_target(
     semantic: torch.Tensor,
     tau: int = 1,
+    block: int = BLOCK,
 ) -> torch.Tensor:
     """Downsample source semantic ids to binary occupancy.
 
-    A cell is foreground iff its 4x4 block contains at least ``tau`` pixels
-    with id > 0. Foreground subclass identity is ignored.
+    A cell is foreground iff its ``block x block`` window contains at least
+    ``tau`` pixels with id > 0. Foreground subclass identity is ignored.
+    Default ``block=4`` is the production R90 contract.
 
     Args:
         semantic: ``[N, H, W]`` long ids. Source maps may still use 0..6.
         tau: Minimum non-background pixels to mark a cell as foreground.
+        block: Spatial downsample factor. Production Vehicle P1 uses 4.
 
     Returns:
-        ``[N, H/4, W/4]`` long ids in ``{0, 1}``.
+        ``[N, H/block, W/block]`` long ids in ``{0, 1}``.
 
     Raises:
-        ValueError: If rank is not 3 or ``H``/``W`` is not divisible by 4.
+        ValueError: If rank is not 3 or ``H``/``W`` is not divisible by ``block``.
     """
     if semantic.dim() != 3:
         raise ValueError(f"semantic must be [N,H,W], got {tuple(semantic.shape)}")
     batch, height, width = semantic.shape
-    if height % BLOCK != 0 or width % BLOCK != 0:
+    block_i = int(block)
+    if height % block_i != 0 or width % block_i != 0:
         raise ValueError(
-            f"cannot partition {tuple(semantic.shape)} into {BLOCK}x{BLOCK} blocks"
+            f"cannot partition {tuple(semantic.shape)} into {block_i}x{block_i} blocks"
         )
-    out_h = height // BLOCK
-    out_w = width // BLOCK
-    patches = semantic.view(batch, out_h, BLOCK, out_w, BLOCK)
-    flat = patches.permute(0, 1, 3, 2, 4).reshape(batch, out_h, out_w, BLOCK * BLOCK)
+    out_h = height // block_i
+    out_w = width // block_i
+    patches = semantic.view(batch, out_h, block_i, out_w, block_i)
+    flat = patches.permute(0, 1, 3, 2, 4).reshape(
+        batch, out_h, out_w, block_i * block_i
+    )
     n_fg = flat.gt(0).sum(dim=-1)
     return n_fg.ge(int(tau)).to(dtype=torch.long)
 
 
-def build_semantic_target(cam_inputs: Mapping[str, Any], tau: int = 1) -> torch.Tensor:
-    """Binary objectness on aligned 4x4 blocks.
+def build_semantic_target(
+    cam_inputs: Mapping[str, Any],
+    tau: int = 1,
+    block: int = BLOCK,
+) -> torch.Tensor:
+    """Binary objectness on aligned ``block x block`` windows.
 
-    If the 4x4 block has fewer than ``tau`` non-background pixels, emit 0.
+    If the window has fewer than ``tau`` non-background pixels, emit 0.
     Otherwise emit 1. Subclass majority / tie-break is not used.
+    Default ``block=4`` keeps production R90 ``[N, 90, 160]``.
 
     Args:
         cam_inputs: ``batch_merged_cam_inputs`` for one agent type.
         tau: Occupancy threshold (approved: 1).
+        block: Spatial downsample factor. Production Vehicle P1 uses 4.
 
     Returns:
-        Objectness target of shape ``[N, 90, 160]``, dtype long, values in
+        Objectness target ``[N, H/block, W/block]``, dtype long, values in
         ``{0, 1}``.
     """
     semantic_gt = cam_inputs.get("image_semantic_gts")
@@ -75,4 +87,6 @@ def build_semantic_target(cam_inputs: Mapping[str, Any], tau: int = 1) -> torch.
         raise ValueError(
             f"image_semantic_gts must be 3D or 4D, got {tuple(semantic_gt.shape)}"
         )
-    return binary_objectness_target(semantic_gt.long(), tau=int(tau))
+    return binary_objectness_target(
+        semantic_gt.long(), tau=int(tau), block=int(block)
+    )

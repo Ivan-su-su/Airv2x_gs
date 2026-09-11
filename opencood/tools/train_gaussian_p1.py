@@ -28,7 +28,10 @@ import opencood.hypes_yaml.yaml_utils as yaml_utils
 from opencood.data_utils.datasets import build_dataset
 from opencood.loss.gaussian_p1_depth_loss import GaussianP1DepthLoss
 from opencood.loss.gaussian_p1_semantic_loss import GaussianP1SemanticLoss
-from opencood.models.gaussian_modules_0822.image_frontend import flatten_camera_world_z
+from opencood.models.gaussian_modules_0822.image_frontend import (
+    flatten_camera_world_z,
+    p1_agent_predictions,
+)
 from opencood.models.gaussian_modules_0822.heatmap.metrics import (
     BACKGROUND_CLASS_ID,
     compute_heatmap_metrics,
@@ -44,7 +47,15 @@ from opencood.models.gaussian_modules_0822.lss.target import (
     extract_camera_z_gt,
 )
 from opencood.tools import multi_gpu_utils, train_utils
+# TEMPORARY TEST→TRAIN mix helpers (delete together with p1_test_mix.py).
+from opencood.tools.p1_test_mix import (
+    apply_test_mix_to_hypes,
+    background_heatmap_targets,
+    batch_is_test_mix,
+    dump_mix_manifest,
+)
 from opencood.tools.train import (
+    _adapt_state_dict_for_model,
     _get_model_state_dict_for_save,
     is_main_process,
     resume_training_from_checkpoint,
@@ -76,7 +87,196 @@ def build_p1_criteria(
     return GaussianP1SemanticLoss(heatmap_args), GaussianP1DepthLoss(depth_args)
 
 
-def print_trainable_families(model: torch.nn.Module) -> None:
+def _finetune_cfg(hypes: Dict[str, Any]) -> Dict[str, Any]:
+    """Return ``hypes['finetune']`` or an empty dict."""
+    cfg = hypes.get("finetune") or {}
+    return cfg if isinstance(cfg, dict) else {}
+
+
+def _keep_drone_branch_param(name: str) -> bool:
+    """True iff ``name`` belongs to the trainable drone P1 branch.
+
+    Keeps drone CamEncode non-BN trunk / up1 / up2, HighResFusion, heatmap,
+    height embedding, and residual depth. Drops EfficientNet BN, official
+    unused heads, and every vehicle/RSU tensor.
+    """
+    if not (
+        name.startswith("frontend.encoders.drone.")
+        or name.startswith("highres.drone.")
+        or name.startswith("heatmap_heads.drone.")
+        or name.startswith("drone_height_embed.")
+        or name.startswith("drone_delta_head.")
+    ):
+        return False
+    if "image_head" in name:
+        return False
+    if "frontend.encoders.drone." in name and ".depth_head." in name:
+        return False
+    if "._conv_head." in name or "._fc." in name:
+        return False
+    if ".trunk." in name and ("_bn" in name or ".bn" in name):
+        return False
+    return True
+
+
+def _keep_vehicle_branch_param(name: str) -> bool:
+    """True iff ``name`` belongs to the trainable vehicle P1 branch.
+
+    Keeps vehicle CamEncode non-BN trunk / up1 / up2, HighResFusion, heatmap,
+    and categorical depth head. Drops EfficientNet BN, official unused heads,
+    and every drone/RSU tensor.
+    """
+    if not (
+        name.startswith("frontend.encoders.vehicle.")
+        or name.startswith("highres.vehicle.")
+        or name.startswith("heatmap_heads.vehicle.")
+        or name.startswith("depth_heads.vehicle.")
+    ):
+        return False
+    if "image_head" in name:
+        return False
+    if "frontend.encoders.vehicle." in name and ".depth_head." in name:
+        return False
+    if "._conv_head." in name or "._fc." in name:
+        return False
+    if ".trunk." in name and ("_bn" in name or ".bn" in name):
+        return False
+    return True
+
+
+def freeze_except_drone_heatmap(model: torch.nn.Module) -> None:
+    """Train only ``heatmap_heads.drone``; freeze every other parameter."""
+    core = _unwrap_model(model)
+    kept: List[str] = []
+    for name, param in core.named_parameters():
+        keep = name.startswith("heatmap_heads.drone")
+        param.requires_grad = keep
+        if keep:
+            kept.append(name)
+    if not kept:
+        raise AssertionError("heatmap_heads.drone not found")
+    print("Finetune trainable:", kept)
+
+
+def freeze_except_drone_branch(model: torch.nn.Module) -> None:
+    """Train the drone encoder + heatmap + residual depth; freeze vehicle/RSU."""
+    core = _unwrap_model(model)
+    kept: List[str] = []
+    for name, param in core.named_parameters():
+        keep = _keep_drone_branch_param(name)
+        param.requires_grad = keep
+        if keep:
+            kept.append(name)
+    if not kept:
+        raise AssertionError("drone branch has no trainable params")
+    print(f"Finetune drone branch trainable: {len(kept)} tensors")
+
+
+def freeze_except_vehicle_branch(model: torch.nn.Module) -> None:
+    """Train vehicle encoder + heatmap + depth; freeze drone/RSU."""
+    core = _unwrap_model(model)
+    kept: List[str] = []
+    for name, param in core.named_parameters():
+        keep = _keep_vehicle_branch_param(name)
+        param.requires_grad = keep
+        if keep:
+            kept.append(name)
+    if not kept:
+        raise AssertionError("vehicle branch has no trainable params")
+    print(f"Finetune vehicle branch trainable: {len(kept)} tensors")
+
+
+def _keep_rsu_branch_param(name: str) -> bool:
+    """True iff ``name`` belongs to the trainable RSU P1 branch.
+
+    Keeps RSU CamEncode non-BN trunk / up1 / up2, HighResFusion, heatmap,
+    and categorical depth head. Drops EfficientNet BN, official unused heads,
+    and every vehicle/drone tensor. Heatmap IS trainable (full branch).
+    """
+    if not (
+        name.startswith("frontend.encoders.rsu.")
+        or name.startswith("highres.rsu.")
+        or name.startswith("heatmap_heads.rsu.")
+        or name.startswith("depth_heads.rsu.")
+    ):
+        return False
+    if "image_head" in name:
+        return False
+    if "frontend.encoders.rsu." in name and ".depth_head." in name:
+        return False
+    if "._conv_head." in name or "._fc." in name:
+        return False
+    if ".trunk." in name and ("_bn" in name or ".bn" in name):
+        return False
+    return True
+
+
+def freeze_except_rsu_branch(model: torch.nn.Module) -> None:
+    """Train RSU encoder + heatmap + categorical depth; freeze vehicle/drone."""
+    core = _unwrap_model(model)
+    kept: List[str] = []
+    for name, param in core.named_parameters():
+        keep = _keep_rsu_branch_param(name)
+        param.requires_grad = keep
+        if keep:
+            kept.append(name)
+    if not kept:
+        raise AssertionError("rsu branch has no trainable params")
+    print(f"Finetune rsu branch trainable: {len(kept)} tensors")
+
+
+def load_p1_weights(model: torch.nn.Module, path: str, device: torch.device) -> None:
+    """Load ``model_state_dict`` only. Does not restore optimizer or epoch."""
+    ckpt = torch.load(path, map_location=device)
+    if not isinstance(ckpt, dict) or "model_state_dict" not in ckpt:
+        raise KeyError(f"{path} has no model_state_dict")
+    state = _adapt_state_dict_for_model(model, ckpt["model_state_dict"])
+    missing, unexpected = model.load_state_dict(state, strict=True)
+    print(f"Loaded pretrained weights from {path} (epoch={ckpt.get('epoch')})")
+    if missing:
+        print("missing:", missing)
+    if unexpected:
+        print("unexpected:", unexpected)
+
+
+def _quarter_save_iters(n_iter: int) -> Dict[int, int]:
+    """Map 1-based iteration index to quarter 1..4."""
+    hits: Dict[int, int] = {}
+    for quarter in (1, 2, 3, 4):
+        hits[max(1, (int(n_iter) * quarter) // 4)] = quarter
+    return hits
+
+
+def _save_p1_checkpoint(
+    saved_path: str,
+    filename: str,
+    epoch: int,
+    model: torch.nn.Module,
+    optimizer: torch.optim.Optimizer,
+    scheduler: Optional[Any],
+    scaler: Optional[amp.GradScaler],
+) -> None:
+    """Write one checkpoint dict under ``saved_path/filename``."""
+    save_dict = {
+        "epoch": epoch,
+        "model_state_dict": _get_model_state_dict_for_save(model),
+        "optimizer_state_dict": optimizer.state_dict(),
+    }
+    if scheduler is not None:
+        save_dict["scheduler_state_dict"] = scheduler.state_dict()
+    if scaler is not None:
+        save_dict["scaler_state_dict"] = scaler.state_dict()
+    torch.save(save_dict, os.path.join(saved_path, filename))
+    print(f"saved {filename}")
+
+
+def print_trainable_families(
+    model: torch.nn.Module,
+    required: bool = True,
+    drone_branch: bool = False,
+    vehicle_branch: bool = False,
+    rsu_branch: bool = False,
+) -> None:
     """Print trainable parameter families once at startup."""
     families = {
         "trunk": [],
@@ -135,19 +335,110 @@ def print_trainable_families(model: torch.nn.Module) -> None:
     unexpected_trainable = families["other"]
     if unexpected_trainable:
         raise AssertionError(f"unexpected trainable params: {unexpected_trainable}")
-    required = (
-        "trunk",
-        "up1",
-        "up2",
-        "highres",
-        "heatmap_head",
-        "depth_head",
-        "drone_height_embed",
-        "drone_delta_head",
-    )
-    for family in required:
-        if not families[family]:
-            raise AssertionError(f"missing trainable family: {family}")
+    if required:
+        required_families = (
+            "trunk",
+            "up1",
+            "up2",
+            "highres",
+            "heatmap_head",
+            "depth_head",
+            "drone_height_embed",
+            "drone_delta_head",
+        )
+        for family in required_families:
+            if not families[family]:
+                raise AssertionError(f"missing trainable family: {family}")
+    elif drone_branch:
+        leaked = [
+            name
+            for name, param in model.named_parameters()
+            if param.requires_grad and not _keep_drone_branch_param(name)
+        ]
+        if leaked:
+            raise AssertionError(f"drone-branch finetune leaked trainable: {leaked}")
+        for family in (
+            "trunk",
+            "up1",
+            "up2",
+            "highres",
+            "heatmap_head",
+            "drone_height_embed",
+            "drone_delta_head",
+        ):
+            if not families[family]:
+                raise AssertionError(f"missing drone-branch family: {family}")
+        veh_rsu = [
+            name
+            for name in families["heatmap_head"] + families["highres"]
+            if ".vehicle." in name or ".rsu." in name
+        ]
+        if veh_rsu:
+            raise AssertionError(f"vehicle/RSU still trainable: {veh_rsu}")
+    elif vehicle_branch:
+        leaked = [
+            name
+            for name, param in model.named_parameters()
+            if param.requires_grad and not _keep_vehicle_branch_param(name)
+        ]
+        if leaked:
+            raise AssertionError(f"vehicle-branch finetune leaked trainable: {leaked}")
+        for family in ("trunk", "up1", "up2", "highres", "heatmap_head", "depth_head"):
+            if not families[family]:
+                raise AssertionError(f"missing vehicle-branch family: {family}")
+        if families["drone_height_embed"] or families["drone_delta_head"]:
+            raise AssertionError("drone residual modules still trainable")
+        non_veh = [
+            name
+            for name in (
+                families["heatmap_head"]
+                + families["highres"]
+                + families["depth_head"]
+                + families["trunk"]
+                + families["up1"]
+                + families["up2"]
+            )
+            if ".drone." in name or ".rsu." in name
+        ]
+        if non_veh:
+            raise AssertionError(f"drone/RSU still trainable: {non_veh}")
+    elif rsu_branch:
+        leaked = [
+            name
+            for name, param in model.named_parameters()
+            if param.requires_grad and not _keep_rsu_branch_param(name)
+        ]
+        if leaked:
+            raise AssertionError(f"rsu-branch finetune leaked trainable: {leaked}")
+        for family in ("trunk", "up1", "up2", "highres", "heatmap_head", "depth_head"):
+            if not families[family]:
+                raise AssertionError(f"missing rsu-branch family: {family}")
+        if families["drone_height_embed"] or families["drone_delta_head"]:
+            raise AssertionError("drone residual modules still trainable")
+        non_rsu = [
+            name
+            for name in (
+                families["heatmap_head"]
+                + families["highres"]
+                + families["depth_head"]
+                + families["trunk"]
+                + families["up1"]
+                + families["up2"]
+            )
+            if ".drone." in name or ".vehicle." in name
+        ]
+        if non_rsu:
+            raise AssertionError(f"drone/vehicle still trainable: {non_rsu}")
+    else:
+        extra = [
+            name
+            for name, param in model.named_parameters()
+            if param.requires_grad and not name.startswith("heatmap_heads.drone")
+        ]
+        if extra:
+            raise AssertionError(f"drone-heatmap finetune leaked trainable: {extra}")
+        if not families["heatmap_head"]:
+            raise AssertionError("drone heatmap head is not trainable")
     drone_categorical = [
         name
         for name in families["depth_head"]
@@ -177,8 +468,15 @@ def setup_p1_optimizer(hypes: Dict[str, Any], model: torch.nn.Module) -> torch.o
     if optimizer_cls is None:
         raise ValueError(f"{opt_cfg['core_method']} is not supported")
     base_lr = float(opt_cfg["lr"])
-    trunk_lr = 0.1 * base_lr
     extra = dict(opt_cfg.get("args") or {})
+    if _finetune_cfg(hypes).get("drone_heatmap_only"):
+        params = [param for param in model.parameters() if param.requires_grad]
+        if not params:
+            raise AssertionError("no trainable params for drone heatmap finetune")
+        optimizer = optimizer_cls(params, lr=base_lr, **extra)
+        print(f"P1 optimizer drone-heatmap-only n={len(params)} lr={base_lr}")
+        return optimizer
+    trunk_lr = 0.1 * base_lr
     trunk_params = []
     new_params = []
     trunk_ids = set()
@@ -315,6 +613,24 @@ def build_depth_valid_masks(
     return masks
 
 
+def build_camera_z_gts(
+    ego: Dict[str, Any],
+    predictions: Dict[str, Dict[str, torch.Tensor]],
+) -> Dict[str, torch.Tensor]:
+    """Continuous GT camera-z for vehicle/RSU. Drone is skipped.
+
+    Used by the depth loss for auxiliary mean supervision and RSU far-range
+    detection. Mirrors :func:`build_depth_valid_masks` without the mask step.
+    """
+    z_gts: Dict[str, torch.Tensor] = {}
+    for agent_type in predictions:
+        if agent_type == "drone":
+            continue
+        imgs = ego[agent_type]["batch_merged_cam_inputs"]["imgs"]
+        z_gts[agent_type] = extract_camera_z_gt(imgs)
+    return z_gts
+
+
 def compute_p1_metrics(
     ego: Dict[str, Any],
     predictions: Dict[str, Dict[str, torch.Tensor]],
@@ -382,23 +698,69 @@ def _forward_loss_metrics(
     depth_criterion: GaussianP1DepthLoss,
     scaler: Optional[amp.GradScaler],
     use_drone_box_support: bool = False,
+    agent_only: Optional[str] = None,
+    skip_depth: bool = False,
+    skip_heatmap: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Dict[str, float]]:
-    """One batch: joint predict, two targets, heatmap Focal + depth, metrics."""
+    """One batch: joint predict, two targets, heatmap Focal + depth, metrics.
+
+    When ``skip_heatmap`` (TEST-mix batch), heatmap targets are forced to
+    all-background so the Focal loss is identically zero: depth-only grad.
+    """
     core_model = _unwrap_model(model)
     with amp.autocast(enabled=scaler is not None):
-        predictions = model(ego)
-        heatmap_targets = build_heatmap_targets(
-            ego, predictions, use_drone_box_support=use_drone_box_support
-        )
-        depth_targets = build_depth_targets(ego, predictions, core_model)
-        depth_valid_masks = build_depth_valid_masks(ego, predictions, core_model)
-        heatmap_loss = semantic_criterion(predictions, heatmap_targets)
-        depth_loss = depth_criterion(
-            predictions, depth_targets, heatmap_targets, depth_valid_masks
-        )
-        total_loss = heatmap_loss + depth_loss
+        predictions = p1_agent_predictions(model(ego))
+        if agent_only is not None:
+            if agent_only not in predictions:
+                zero = sum(
+                    param.sum() * 0.0
+                    for param in model.parameters()
+                    if param.requires_grad
+                )
+                empty: Dict[str, float] = {}
+                return zero, zero, zero, empty
+            predictions = {agent_only: predictions[agent_only]}
+        if skip_heatmap:
+            # TEST frames carry no SAM3 ``*_seg.bin``; all-background targets
+            # make heatmap Focal exactly 0, so no heatmap gradient leaks in.
+            heatmap_targets = background_heatmap_targets(predictions)
+            first_logits = next(iter(predictions.values()))["heatmap_logits"]
+            heatmap_loss = first_logits.sum() * 0.0
+            depth_targets = build_depth_targets(ego, predictions, core_model)
+            depth_valid_masks = build_depth_valid_masks(ego, predictions, core_model)
+            camera_z_gts = build_camera_z_gts(ego, predictions)
+            depth_loss = depth_criterion(
+                predictions,
+                depth_targets,
+                heatmap_targets,
+                depth_valid_masks,
+                camera_z_gts=camera_z_gts,
+            )
+            total_loss = heatmap_loss + depth_loss
+        else:
+            heatmap_targets = build_heatmap_targets(
+                ego, predictions, use_drone_box_support=use_drone_box_support
+            )
+            if skip_depth:
+                heatmap_loss = semantic_criterion(predictions, heatmap_targets)
+                depth_loss = heatmap_loss.detach() * 0.0
+                total_loss = heatmap_loss
+            else:
+                depth_targets = build_depth_targets(ego, predictions, core_model)
+                depth_valid_masks = build_depth_valid_masks(ego, predictions, core_model)
+                camera_z_gts = build_camera_z_gts(ego, predictions)
+                heatmap_loss = semantic_criterion(predictions, heatmap_targets)
+                depth_loss = depth_criterion(
+                    predictions,
+                    depth_targets,
+                    heatmap_targets,
+                    depth_valid_masks,
+                    camera_z_gts=camera_z_gts,
+                )
+                total_loss = heatmap_loss + depth_loss
     metrics = compute_p1_metrics(ego, predictions, heatmap_targets, core_model)
-    metrics.update(depth_criterion.loss_dict)
+    if not skip_depth:
+        metrics.update(depth_criterion.loss_dict)
     return total_loss, heatmap_loss, depth_loss, metrics
 
 
@@ -461,14 +823,77 @@ def main() -> None:
     opt = train_parser()
     hypes = yaml_utils.load_yaml(opt.hypes_yaml, opt)
     hypes["tag"] = opt.tag
+    finetune = _finetune_cfg(hypes)
+    drone_hm = bool(finetune.get("drone_heatmap_only"))
+    drone_branch = bool(finetune.get("drone_branch"))
+    vehicle_branch = bool(finetune.get("vehicle_branch"))
+    rsu_branch = bool(finetune.get("rsu_branch"))
+    if (
+        sum(bool(x) for x in (drone_hm, drone_branch, vehicle_branch, rsu_branch))
+        > 1
+    ):
+        raise ValueError(
+            "finetune flags are mutually exclusive: "
+            "drone_heatmap_only / drone_branch / vehicle_branch / rsu_branch"
+        )
+    branch_only = drone_hm or drone_branch or vehicle_branch or rsu_branch
+    if drone_hm or drone_branch:
+        agent_only: Optional[str] = "drone"
+    elif vehicle_branch:
+        agent_only = "vehicle"
+    elif rsu_branch:
+        agent_only = "rsu"
+    else:
+        agent_only = None
+    save_quarters = bool(finetune.get("save_quarters"))
+    pretrained = finetune.get("pretrained")
+    # TEMPORARY TEST→TRAIN mix (delete with p1_test_mix.py): when
+    # ``test_mix_keep_frac`` is set, extra_train_scenes is replaced by the
+    # first frac of every TEST scene; those batches train depth only.
+    test_mix_on = finetune.get("test_mix_keep_frac") is not None
+    skip_heatmap_on_test_mix = bool(finetune.get("skip_heatmap_on_test_mix"))
+    if test_mix_on:
+        apply_test_mix_to_hypes(hypes)
+        if not skip_heatmap_on_test_mix:
+            print(
+                "[test-mix] WARNING: skip_heatmap_on_test_mix=false — TEST "
+                "frames have no SAM3 labels, heatmap WILL train on empty GT."
+            )
     print("load from yaml file: ", opt.hypes_yaml)
-    print("P1 mode: joint heatmap + depth (single architecture)")
-    print(
-        "P1 experiment: TRAIN drone heatmap = GT-box OR SAM3; "
-        "L2_hl RGB on TRAIN 2025_05_06_10_01_50 and TEST 2025_05_10_19_54_35; "
-        "TRAIN fog on 40% of non-night timestamps. "
-        "Do not resume a pre-experiment checkpoint as the same run."
-    )
+    if drone_hm:
+        print("P1 mode: drone heatmap finetune (all other modules frozen)")
+        print(
+            "Mix TEST fog 2025_05_05_23_26_24 (first 70%, stride 4, 219 frames). "
+            "No synthetic fog on those frames. Loss = drone heatmap only."
+        )
+    elif drone_branch:
+        print("P1 mode: drone-branch finetune (vehicle/RSU frozen)")
+        print(
+            "Train drone encoder + heatmap + residual depth. "
+            "Mix TEST fog 2025_05_05_23_26_24 (first 70%, stride 4, 219 frames). "
+            "Loss = drone heatmap + drone depth."
+        )
+    elif vehicle_branch:
+        print("P1 mode: vehicle-branch finetune (drone/RSU frozen)")
+        print(
+            "Train vehicle encoder + heatmap + categorical depth from "
+            "concat128 pretrained. Loss = vehicle heatmap + vehicle depth."
+        )
+    elif rsu_branch:
+        print("P1 mode: rsu-branch finetune (vehicle/drone frozen)")
+        print(
+            "Train RSU encoder + heatmap + categorical depth from "
+            "concat128 pretrained. Heatmap IS trained (full branch). "
+            "Loss = rsu heatmap + rsu depth (+ optional aux mean / far-weight)."
+        )
+    else:
+        print("P1 mode: joint heatmap + depth (single architecture)")
+        print(
+            "P1 experiment: TRAIN drone heatmap = GT-box OR SAM3; "
+            "L2_hl RGB on TRAIN 2025_05_06_10_01_50 and TEST 2025_05_10_19_54_35; "
+            "TRAIN fog on 40% of non-night timestamps. "
+            "Do not resume a pre-experiment checkpoint as the same run."
+        )
 
     # Build the AirV2X file index before NCCL. parse_seq reads tens of
     # thousands of metadata.pkl files; doing that after the first ALLREDUCE
@@ -484,11 +909,6 @@ def main() -> None:
 
     print("Creating model...")
     model = train_utils.create_model(hypes)
-    total_params = sum(p.nelement() for p in model.parameters())
-    trainable_params = sum(p.nelement() for p in model.parameters() if p.requires_grad)
-    print(f"Total parameters: {total_params:,}")
-    print(f"Trainable parameters: {trainable_params:,}")
-    print_trainable_families(model)
 
     if opt.distributed:
         assert torch.cuda.is_available(), "Distributed training requires CUDA"
@@ -503,11 +923,36 @@ def main() -> None:
             device = torch.device("cpu")
 
     model.to(device)
+    if pretrained and not opt.model_dir:
+        load_p1_weights(model, str(pretrained), device)
+    if drone_hm:
+        freeze_except_drone_heatmap(model)
+    elif drone_branch:
+        freeze_except_drone_branch(model)
+    elif vehicle_branch:
+        freeze_except_vehicle_branch(model)
+    elif rsu_branch:
+        freeze_except_rsu_branch(model)
+    total_params = sum(p.nelement() for p in model.parameters())
+    trainable_params = sum(p.nelement() for p in model.parameters() if p.requires_grad)
+    print(f"Total parameters: {total_params:,}")
+    print(f"Trainable parameters: {trainable_params:,}")
+    print_trainable_families(
+        model,
+        required=not branch_only,
+        drone_branch=drone_branch,
+        vehicle_branch=vehicle_branch,
+        rsu_branch=rsu_branch,
+    )
+
     if opt.distributed:
         model = torch.nn.parallel.DistributedDataParallel(
             model,
             device_ids=[opt.gpu],
             output_device=opt.gpu,
+            # branch finetune freezes vehicle/drone via requires_grad=False, so
+            # DDP never sees them -> there are no unused parameters. The flag
+            # was causing "marked ready twice" with the aux-mean depth path.
             find_unused_parameters=False,
         )
 
@@ -542,6 +987,10 @@ def main() -> None:
     assert saved_path is not None
 
     writer = SummaryWriter(saved_path) if main_process else None
+    # TEMPORARY (delete with p1_test_mix.py): record which TEST timestamps
+    # entered TRAIN so TEST eval can hold them out.
+    if test_mix_on and main_process:
+        dump_mix_manifest(train_dataset, saved_path)
     print("Starting joint P1 training...")
     epochs = hypes["train_params"]["epoches"]
 
@@ -553,11 +1002,14 @@ def main() -> None:
         print(f"Current learning rate: {optimizer.param_groups[0]['lr']}")
 
         model.train()
-        _unwrap_model(model).frontend.assert_train_eval_state(True)
+        if not branch_only:
+            _unwrap_model(model).frontend.assert_train_eval_state(True)
 
+        n_iter = len(train_loader)
+        quarter_hits = _quarter_save_iters(n_iter) if save_quarters else {}
         pbar = tqdm(
             enumerate(train_loader),
-            total=len(train_loader),
+            total=n_iter,
             disable=not main_process,
         )
         for i, batch_data in pbar:
@@ -568,6 +1020,8 @@ def main() -> None:
             batch_data = train_utils.to_device(batch_data, device)
             ego = batch_data["ego"]
             ego["epoch"] = epoch
+            # TEMPORARY (delete with p1_test_mix.py): depth-only on TEST mix.
+            is_test_mix = test_mix_on and batch_is_test_mix(ego)
             total_loss, heatmap_loss, depth_loss, metrics = _forward_loss_metrics(
                 model,
                 ego,
@@ -575,6 +1029,9 @@ def main() -> None:
                 depth_criterion,
                 scaler,
                 use_drone_box_support=True,
+                agent_only=agent_only,
+                skip_depth=drone_hm,
+                skip_heatmap=is_test_mix and skip_heatmap_on_test_mix,
             )
             if scaler is not None:
                 scaler.scale(total_loss).backward()
@@ -586,7 +1043,7 @@ def main() -> None:
 
             if main_process:
                 assert writer is not None
-                step = epoch * len(train_loader) + i
+                step = epoch * n_iter + i
                 heatmap_v = float(heatmap_loss.item())
                 depth_v = float(depth_loss.item())
                 total_v = float(total_loss.item())
@@ -602,34 +1059,63 @@ def main() -> None:
                         writer.add_scalar(f"Train/{agent_key}", metrics[agent_key], step)
                 print_msg = (
                     "[epoch %d][%d/%d] || total: %.4f | focal: %.4f | depth: %.4f"
-                    % (epoch, i + 1, len(train_loader), total_v, heatmap_v, depth_v)
+                    % (epoch, i + 1, n_iter, total_v, heatmap_v, depth_v)
                 )
                 pbar.set_description(print_msg)
                 _log_metrics(writer, metrics, step, "Train")
                 with open(os.path.join(saved_path, "train_loss.txt"), "a+") as handle:
                     handle.write(
-                        f"Epoch[{epoch}], iter[{i}/{len(train_loader)}], "
+                        f"Epoch[{epoch}], iter[{i}/{n_iter}], "
                         f"total[{total_v:.4f}], heatmap[{heatmap_v:.4f}], "
                         f"depth[{depth_v:.4f}]\n"
                     )
+
+            if save_quarters and (i + 1) in quarter_hits:
+                if opt.distributed:
+                    torch.cuda.synchronize()
+                    torch.distributed.barrier()
+                if opt.rank == 0:
+                    quarter = quarter_hits[i + 1]
+                    _save_p1_checkpoint(
+                        saved_path,
+                        f"net_epoch{epoch + 1}_q{quarter}.pth",
+                        epoch,
+                        model,
+                        optimizer,
+                        scheduler,
+                        scaler,
+                    )
+                    if quarter == 4:
+                        _save_p1_checkpoint(
+                            saved_path,
+                            f"net_epoch{epoch + 1}.pth",
+                            epoch,
+                            model,
+                            optimizer,
+                            scheduler,
+                            scaler,
+                        )
 
         if opt.distributed:
             torch.cuda.synchronize()
             torch.distributed.barrier()
 
-        if opt.rank == 0 and epoch % hypes["train_params"]["save_freq"] == 0:
-            save_dict = {
-                "epoch": epoch,
-                "model_state_dict": _get_model_state_dict_for_save(model),
-                "optimizer_state_dict": optimizer.state_dict(),
-            }
-            if scheduler is not None:
-                save_dict["scheduler_state_dict"] = scheduler.state_dict()
-            if scaler is not None:
-                save_dict["scaler_state_dict"] = scaler.state_dict()
-            torch.save(save_dict, os.path.join(saved_path, f"net_epoch{epoch + 1}.pth"))
+        if (
+            not save_quarters
+            and opt.rank == 0
+            and epoch % hypes["train_params"]["save_freq"] == 0
+        ):
+            _save_p1_checkpoint(
+                saved_path,
+                f"net_epoch{epoch + 1}.pth",
+                epoch,
+                model,
+                optimizer,
+                scheduler,
+                scaler,
+            )
 
-        if epoch % hypes["train_params"]["eval_freq"] == 0:
+        if (not branch_only) and epoch % hypes["train_params"]["eval_freq"] == 0:
             if opt.distributed and isinstance(val_loader.sampler, DistributedSampler):
                 val_loader.sampler.set_epoch(epoch)
             local_total, local_hm, local_dep, local_cnt, extra_metrics = validate_p1(

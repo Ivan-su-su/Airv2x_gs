@@ -1,0 +1,281 @@
+########
+# Name #
+########
+
+name: vehicle_v45_p1
+
+############
+# Training #
+############
+
+# Standalone Vehicle-only P1 at output stride 8 (45x80).
+# Does not train RSU/Drone/Gaussian/BEV. Opt-in only.
+
+active_sensors: &active_sensors ["cam"]
+# Dataset padding is always vehicle+rsu+drone up to max_cav each.
+# Keep all three here so max_cav_num=15. The V45 MODEL still reads only vehicle.
+collaborators: &collaborators ["vehicle", "rsu", "drone"]
+ego_type: &ego_type vehicle
+bevcam_fov: 110
+
+yaml_parser: "load_airv2x_params"
+train_params:
+  batch_size: &batch_size 1
+  epoches: 20
+  eval_freq: 999
+  save_freq: 1
+  max_cav: &max_cav
+    vehicle: 5
+    rsu: 5
+    drone: 5
+
+device: &device cuda
+train: &train True
+
+
+###########
+# Dataset #
+###########
+# Dataset/parser still preprocess LiDAR metadata because
+# IntermediateFusionDatasetAirv2x / load_airv2x_params require these fields.
+# collaborators must stay vehicle+rsu+drone: __getitem__ concatenates all
+# three agent types then pads to max_cav_num. Vehicle-only collaborators
+# makes max_cav_num=5 and np.tile gets a negative repeat.
+# The V45 MODEL still ignores RSU/Drone tensors.
+
+root_dir: '/mnt/home/suyi/AirV2X-Perception/train/train'
+validate_dir: '/mnt/home/suyi/AirV2X-Perception/val/val'
+test_dir: '/mnt/home/suyi/AirV2X-Perception/test'
+# extra_train_scenes is auto-filled from test_dir by tools/p1_test_mix.py
+# (first test_mix_keep_frac of every TEST scene, stride 1).
+finetune:
+  save_quarters: true
+  # Align with V90 vehicle branch: mix 20% of every TEST scene;
+  # those batches train depth ONLY (TEST has no SAM3 *_seg.bin).
+  test_mix_keep_frac: 0.2
+  skip_heatmap_on_test_mix: true
+  pretrained: '/mnt/home/suyi/AirV2X-Perception_gaussian/opencood/logs/airv2x_gaussian_final/net_final_branch.pth'
+
+num_class: &num_class 7
+num_anchor: &num_anchor 2
+
+seg_branch: &seg_branch "both"
+seg_hw: &seg_hw 512
+seg_res: &seg_res 0.25
+dynamic_class: &dynamic_class 7
+static_class: &static_class 3
+
+fusion:
+  core_method: 'IntermediateFusionDatasetAirv2x'
+  args:
+    proj_first: &proj_first true
+    veh_grid_conf: &veh_grid_conf
+      xbound: [-140.8, 140.8, 0.4]
+      ybound: [-40, 40, 0.4]
+      zbound: [-10, 10, 20.0]
+      ddiscr: [0, 50, 50]
+      mode: 'LID'
+    veh_data_aug_conf: &veh_data_aug_conf_image
+      resize_lim: [0.65, 0.7]
+      final_dim: [360, 640]
+      rot_lim: [0, 0]
+      H: 720
+      W: 1280
+      rand_flip: False
+      bot_pct_lim: [0.0, 0.05]
+
+    rsu_grid_conf: &rsu_grid_conf
+      xbound: [-140.8, 140.8, 0.4]
+      ybound: [-40, 40, 0.4]
+      zbound: [-30, 30, 60.0]
+      ddiscr: [2, 50, 48]
+      mode: 'LID'
+    rsu_data_aug_conf: &rsu_data_aug_conf_image
+      resize_lim: [0.65, 0.7]
+      final_dim: [360, 640]
+      rot_lim: [0, 0]
+      H: 720
+      W: 1280
+      rand_flip: False
+      bot_pct_lim: [0.0, 0.05]
+
+    drone_grid_conf: &drone_grid_conf
+      xbound: [-140.8, 140.8, 0.4]
+      ybound: [-40, 40, 0.4]
+      zbound: [-150, -6, 144]
+      ddiscr: [6, 150, 144]
+      mode: 'UD'
+    drone_data_aug_conf: &drone_data_aug_conf_image
+      resize_lim: [0.65, 0.7]
+      final_dim: [360, 640]
+      rot_lim: [-3.6, 3.6]
+      H: 720
+      W: 1280
+      rand_flip: False
+      bot_pct_lim: [0.0, 0.05]
+
+data_augment:
+  - NAME: random_world_flip
+    ALONG_AXIS_LIST: [ 'x' ]
+  - NAME: random_world_rotation
+    WORLD_ROT_ANGLE: [ -0.78539816, 0.78539816 ]
+  - NAME: random_world_scaling
+    WORLD_SCALE_RANGE: [ 0.95, 1.05 ]
+
+preprocess:
+  core_method: 'SpVoxelPreprocessor'
+  ego_type: *ego_type
+  args:
+    voxel_size: &voxel_size [0.4, 0.4, 4]
+    max_points_per_voxel: 32
+    max_voxel_train: 32000
+    max_voxel_test: 70000
+  cav_lidar_range: &cav_lidar [-140.8, -40, -3, 140.8, 40, 1]
+POINT_CLOUD_RANGE: *cav_lidar
+
+postprocess:
+  core_method: 'VoxelPostprocessor'
+  ego_type: *ego_type
+  anchor_args:
+    cav_lidar_range: *cav_lidar
+    l: 3.9
+    w: 1.6
+    h: 1.56
+    r: [0, 90]
+    feature_stride: 2
+    num: *num_anchor
+  target_args:
+    pos_threshold: 0.60
+    neg_threshold: 0.45
+    score_threshold: 0.20
+    obj_threshold: 0.20
+  order: 'hwl'
+  max_num: 300
+  nms_thresh: 0.15
+
+
+#########
+# Model #
+#########
+
+model:
+  core_method: vehicle_v45_p1
+  args:
+    ego_type: *ego_type
+    collaborators: *collaborators
+    active_sensors: *active_sensors
+    max_cav: *max_cav
+    device: *device
+    train: *train
+    output_stride: 8
+    heatmap_num_classes: 2
+    BACKBONE_2D:
+      LOAD_IMAGE_SEMANTIC_GT: true
+
+    vehicle:
+      modalities: ["cam"]
+      lidar:
+        voxel_size: [0.4, 0.4, 4]
+        lidar_range: [-140.8, -40, -3, 140.8, 40, 1]
+        compression: 0
+        backbone_fix: false
+        pillar_vfe:
+          use_norm: true
+          with_distance: false
+          use_absolute_xyz: true
+          num_filters: [64]
+        point_pillar_scatter:
+          num_features: 64
+      cam:
+        grid_conf: *veh_grid_conf
+        data_aug_conf: *veh_data_aug_conf_image
+        img_downsample: 8
+        img_features: 64
+        bevout_feature: 64
+        camera_encoder: EfficientNet
+        use_depth_gt: false
+        depth_supervision: true
+
+    # Inert parser stubs. VehicleV45P1 does not instantiate these agents.
+    rsu:
+      modalities: ["cam"]
+      lidar:
+        voxel_size: [0.4, 0.4, 60]
+        lidar_range: [-140.8, -40, -30, 140.8, 40, 30]
+        compression: 0
+        backbone_fix: false
+        pillar_vfe:
+          use_norm: true
+          with_distance: false
+          use_absolute_xyz: true
+          num_filters: [64]
+        point_pillar_scatter:
+          num_features: 64
+      cam:
+        grid_conf: *rsu_grid_conf
+        data_aug_conf: *rsu_data_aug_conf_image
+        img_downsample: 8
+        img_features: 64
+        bevout_feature: 64
+        camera_encoder: EfficientNet
+        use_depth_gt: false
+        depth_supervision: true
+
+    drone:
+      modalities: ["cam"]
+      lidar:
+        voxel_size: [0.4, 0.4, 144]
+        lidar_range: [-140.8, -40, -150, 140.8, 40, -6]
+        compression: 0
+        backbone_fix: false
+        pillar_vfe:
+          use_norm: true
+          with_distance: false
+          use_absolute_xyz: true
+          num_filters: [64]
+        point_pillar_scatter:
+          num_features: 64
+      cam:
+        grid_conf: *drone_grid_conf
+        data_aug_conf: *drone_data_aug_conf_image
+        img_downsample: 8
+        img_features: 64
+        bevout_feature: 64
+        camera_encoder: EfficientNet
+        use_depth_gt: false
+        depth_supervision: true
+
+
+##################
+# Loss Functions #
+##################
+# total_loss = vehicle_heatmap_loss + vehicle_depth_loss
+# Same Vehicle supervision as V90; only spatial stride changes.
+
+loss:
+  heatmap:
+    args:
+      gamma: 2.0
+  depth:
+    args:
+      alpha: 0.25
+      gamma: 2.0
+      smooth_target: false
+      metric_lambda: 0.3
+
+
+###########
+# Learner #
+###########
+
+optimizer:
+  core_method: Adam
+  lr: 0.002
+  args:
+    eps: 1e-10
+    weight_decay: 1e-4
+
+lr_scheduler:
+  core_method: multistep
+  gamma: 0.1
+  step_size: [10, 25, 40]

@@ -308,6 +308,37 @@ model:
     seg_res: *seg_res
     obj_head: true
 
+    gaussian_range_filter:
+      enabled: true
+
+    gaussian_refinement:
+      enabled: true
+      geometry:
+        input_dim: 10
+        geo_dim: 64
+      fusion:
+        hidden_dim: 256
+      agents:
+        vehicle:
+          unit_xyz: [4.0, 4.0, 1.0]
+        rsu:
+          unit_xyz: [5.0, 5.0, 2.0]
+        drone:
+          unit_xyz: [5.0, 5.0, 3.0]
+      scale:
+        beta: 0.5
+      rotation:
+        max_angle: 0.2
+
+    gaussian_stage3:
+      enabled: true
+      voxel_size: [0.4, 0.4, 0.125]
+      # x/y from detection cav_lidar_range, z is the union of agent zbounds
+      point_cloud_range: [-140.8, -40.0, -150.0, 140.8, 40.0, 30.0]
+      num_heads: 4
+      adapter_bottleneck: 64
+      bev_n_sigma: 3.0
+
 
 ##################
 # Loss Functions #

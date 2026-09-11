@@ -34,7 +34,10 @@ from opencood.models.gaussian_modules_0822.heatmap.metrics import (
     PRIMARY_OBJECTNESS_THRESHOLD,
 )
 from opencood.models.gaussian_modules_0822.heatmap.target import build_semantic_target
-from opencood.models.gaussian_modules_0822.image_frontend import present_camera_agents
+from opencood.models.gaussian_modules_0822.image_frontend import (
+    p1_agent_predictions,
+    present_camera_agents,
+)
 from opencood.models.gaussian_modules_0822.lss.target import (
     extract_camera_z_gt,
     depth_valid_mask,
@@ -280,7 +283,7 @@ def main() -> None:
                 break
             batch_data = train_utils.to_device(batch_data, device)
             ego = batch_data["ego"]
-            predictions = model(ego)
+            predictions = p1_agent_predictions(model(ego))
             heatmap_targets: Dict[str, torch.Tensor] = {}
             for agent_type in present_camera_agents(ego):
                 cam_inputs = ego[agent_type]["batch_merged_cam_inputs"]

@@ -1,4 +1,5 @@
 import math
+import time
 
 import cv2
 import numpy as np
@@ -6,6 +7,48 @@ import torch
 import torchvision
 from PIL import Image
 from shapely.geometry import MultiPoint
+
+
+_DUMMY_SIZE = (1280, 720)  # AirV2X native camera WH
+_DUMMY_MODE = "RGB"
+
+
+def _dummy_image(size=_DUMMY_SIZE, mode=_DUMMY_MODE):
+    """Black placeholder so one bad PNG cannot kill a DDP rank."""
+    return Image.new(mode or _DUMMY_MODE, size or _DUMMY_SIZE)
+
+
+def _open_image_with_retry(camera_file, preload=True, retries=2):
+    """Decode one PNG/JPEG and close the fd before returning pixels.
+
+    PIL ``Image.open`` is lazy: ``.copy()`` is the first real ``read()``.
+    Some TEST-mix depth files are physically truncated on disk (``stat``
+    size > readable bytes) and always raise ``Errno 5``; after retries we
+    return a dummy so DDP stays in sync. Depth GT of 0 is out of range and
+    dropped by ``depth_valid_mask``.
+    """
+    header_size = None
+    header_mode = None
+    last_err = None
+    for attempt in range(1, retries + 1):
+        try:
+            with Image.open(camera_file) as img:
+                header_size = img.size
+                header_mode = img.mode
+                return img.copy() if preload else img.convert(img.mode)
+        except OSError as err:
+            last_err = err
+            print(
+                f"[camera] read fail {attempt}/{retries} {camera_file}: {err}",
+                flush=True,
+            )
+            time.sleep(0.2 * attempt)
+    print(
+        f"[camera] dummy image after {retries} fails ({header_mode} "
+        f"{header_size}): {camera_file} ({last_err})",
+        flush=True,
+    )
+    return _dummy_image(header_size, header_mode)
 
 
 def load_camera_data(camera_files, preload=True):
@@ -21,10 +64,7 @@ def load_camera_data(camera_files, preload=True):
     """
     camera_data_list = []
     for camera_file in camera_files:
-        camera_data = Image.open(camera_file)
-        if preload:
-            camera_data = camera_data.copy()
-        camera_data_list.append(camera_data)
+        camera_data_list.append(_open_image_with_retry(camera_file, preload))
     return camera_data_list
 
 
@@ -249,6 +289,7 @@ normalize_img = torchvision.transforms.Compose(
 L2_TRAIN_SCENARIO_ID = "2025_05_06_10_01_50"
 L2_TEST_SCENARIO_ID = "2025_05_10_19_54_35"
 L2_SCENARIO_IDS = (L2_TRAIN_SCENARIO_ID, L2_TEST_SCENARIO_ID)
+REAL_FOG_SCENARIO_ID = "2025_05_05_23_26_24"
 L1_GAIN = 0.35
 L1_GAMMA = 1.8
 L2_GAIN = 0.25
@@ -273,6 +314,15 @@ def is_l2_train_night_scenario(metadata_path, is_train=None):
         return False
     parts = str(metadata_path).replace("\\", "/").split("/")
     return any(sid in parts for sid in L2_SCENARIO_IDS)
+
+
+def is_real_fog_scenario(metadata_path, is_train=None):
+    """True iff the path belongs to TEST fog scene ``2025_05_05_23_26_24``."""
+    del is_train
+    if metadata_path is None:
+        return False
+    parts = str(metadata_path).replace("\\", "/").split("/")
+    return REAL_FOG_SCENARIO_ID in parts
 
 
 def _apply_gain_gamma_rgb(rgb, gain, gamma, eps=L2_EPS):

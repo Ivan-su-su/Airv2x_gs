@@ -26,19 +26,25 @@ def _camera_z_from_imgs(imgs: torch.Tensor) -> torch.Tensor:
     return flat_imgs[:, 3, :, :].clone()
 
 
-def build_depth_class_target(camencode: CamEncode, imgs: torch.Tensor) -> torch.Tensor:
+def build_depth_class_target(
+    camencode: CamEncode,
+    imgs: torch.Tensor,
+    spatial_stride: int = SPATIAL_STRIDE,
+) -> torch.Tensor:
     """Official LID/UD bins at aligned block centers.
 
     Clones camera-z, applies official ``clamp_max_(d_max)``, then
     ``camera_utils.bin_depths`` with ``target=camencode.training``.
+    Default ``spatial_stride=4`` is the production R90 contract.
 
     Args:
         camencode: Live encoder (``d_min``, ``d_max``, ``num_bins``, ``mode``,
             ``training``). ``downsample`` is not used for spatial sampling.
         imgs: ``[B_a, V, C, H, W]`` or ``[N, C, H, W]``, C>=4.
+        spatial_stride: Output stride in pixels. Production Vehicle P1 uses 4.
 
     Returns:
-        ``depth_z_indices_gt`` of shape ``[N, 90, 160]``.
+        ``depth_z_indices_gt`` of shape ``[N, H/stride, W/stride]``.
     """
     camera_z = _camera_z_from_imgs(imgs)
     torch.clamp_max_(camera_z, camencode.d_max)
@@ -50,16 +56,23 @@ def build_depth_class_target(camencode: CamEncode, imgs: torch.Tensor) -> torch.
         camencode.num_bins,
         target=bool(camencode.training),
     )
-    offset = SPATIAL_STRIDE // 2
-    sampled = depth_indices[:, offset::SPATIAL_STRIDE, offset::SPATIAL_STRIDE]
+    stride = int(spatial_stride)
+    offset = stride // 2
+    sampled = depth_indices[:, offset::stride, offset::stride]
     return sampled.long()
 
 
-def extract_camera_z_gt(imgs: torch.Tensor) -> torch.Tensor:
-    """Unclamped camera-z at R90 block centers."""
+def extract_camera_z_gt(
+    imgs: torch.Tensor, spatial_stride: int = SPATIAL_STRIDE
+) -> torch.Tensor:
+    """Unclamped camera-z at aligned block centers.
+
+    Default ``spatial_stride=4`` is the production R90 contract.
+    """
     camera_z_full = _camera_z_from_imgs(imgs)
-    offset = SPATIAL_STRIDE // 2
-    return camera_z_full[:, offset::SPATIAL_STRIDE, offset::SPATIAL_STRIDE]
+    stride = int(spatial_stride)
+    offset = stride // 2
+    return camera_z_full[:, offset::stride, offset::stride]
 
 
 def depth_valid_mask(
