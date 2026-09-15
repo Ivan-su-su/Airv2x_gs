@@ -6,6 +6,12 @@ of ``Σ_xy = Σ_3d[:2, :2]``. Neighborhoods are generated per
 ``(radius_x, radius_y)`` bucket so one large Gaussian cannot enlarge the
 offset grid of the others.
 
+Aggregation is an unnormalized direct Gaussian weighted sum:
+``BEV(p) = Σ_i feature_i * exp(-0.5 * Mahalanobis²(i, p))``. The kernel
+keeps its absolute radial decay; contributions are NOT divided by the
+accumulated weight (a normalized average would flatten the kernel to a
+plateau for singly-covered cells).
+
 BEV layout matches ``PointPillarScatter``: ``[B, C, ny, nx]`` with rows
 along y and columns along x.
 """
@@ -125,16 +131,16 @@ class GaussianBEVSplat(nn.Module):
         weight = torch.exp(-0.5 * d2[support])
         n_valid = int(g_idx.shape[0])
 
+        # Preserve the absolute Gaussian spatial response.
+        # Each Gaussian contributes feature * exp(-0.5 * Mahalanobis^2)
+        # and overlapping Gaussian contributions are summed directly.
+        # Do NOT normalize by the accumulated Gaussian weights here:
+        # for a singly-covered cell that would compute
+        # (f * w) / w = f and cancel the radial decay entirely,
+        # turning the kernel into a flat plateau inside the support.
         flat = batch_index[g_idx] * (ny * nx) + iy * nx + ix
         bev = gaussians.feature.new_zeros((n_batch * ny * nx, self.feature_dim))
         bev.index_add_(0, flat, gaussians.feature[g_idx] * weight.unsqueeze(-1))
-        weight_sum = torch.zeros(n_batch * ny * nx, device=device, dtype=dtype)
-        weight_sum.index_add_(0, flat, weight)
-        bev = torch.where(
-            (weight_sum > 0).unsqueeze(-1),
-            bev / weight_sum.clamp_min(1.0e-8).unsqueeze(-1),
-            bev,
-        )
         splat_ms = (time.perf_counter() - t0) * 1000.0
         self.last_stats = {
             "n_gaussians": n,

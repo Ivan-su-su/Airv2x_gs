@@ -492,22 +492,31 @@ def main():
             if scaler is not None:
                 scaler.scale(loss).backward()
                 scaler.unscale_(optimizer)
+                # grad_norm = torch.nn.utils.clip_grad_norm_(
+                #     model.parameters(), max_norm=1.0
+                # )
+                # Safety clip only. max_norm=1.0 truncated ~6-13x every step.
                 grad_norm = torch.nn.utils.clip_grad_norm_(
-                    model.parameters(), max_norm=1.0
+                    model.parameters(), max_norm=20.0
                 )
                 scaler.step(optimizer)
                 scaler.update()
             else:
                 loss.backward()
+                # grad_norm = torch.nn.utils.clip_grad_norm_(
+                #     model.parameters(), max_norm=1.0
+                # )
+                # Safety clip only. max_norm=1.0 truncated ~6-13x every step.
                 grad_norm = torch.nn.utils.clip_grad_norm_(
-                    model.parameters(), max_norm=1.0
+                    model.parameters(), max_norm=20.0
                 )
                 optimizer.step()
             if main_process and grad_norm is not None:
                 gn = float(grad_norm)
                 if math.isfinite(gn):
                     n_step += 1
-                    n_clip += int(gn > 1.0)
+                    # n_clip += int(gn > 1.0)
+                    n_clip += int(gn > 20.0)
                 else:
                     n_nonfinite_grad += 1
             

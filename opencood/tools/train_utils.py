@@ -479,13 +479,20 @@ def setup_optimizer(hypes, model):
     optimizer_method = getattr(optim, method_dict["core_method"], None)
     if not optimizer_method:
         raise ValueError("{} is not supported".format(method_dict["name"]))
+    # Unified 3-group split: 1D / bias -> 0; ALL stage3.* ndim>1 matrices
+    # (split_mlp / self_blocks / cross_blocks / adapter / fusion_mlp) -> 0;
+    # every other ndim>1 matrix -> YAML weight_decay (currently 1e-4).
     decay = []
+    stage3_no_decay = []
     no_decay = []
     for name, param in model.named_parameters():
         if not param.requires_grad:
             continue
-        if param.ndim <= 1 or name.endswith(".bias"):
+        clean_name = name[7:] if name.startswith("module.") else name
+        if param.ndim <= 1 or clean_name.endswith(".bias"):
             no_decay.append(param)
+        elif clean_name.startswith("stage3."):
+            stage3_no_decay.append(param)
         else:
             decay.append(param)
     extra = dict(method_dict.get("args") or {})
@@ -493,6 +500,8 @@ def setup_optimizer(hypes, model):
     groups = []
     if decay:
         groups.append({"params": decay, "weight_decay": weight_decay})
+    if stage3_no_decay:
+        groups.append({"params": stage3_no_decay, "weight_decay": 0.0})
     if no_decay:
         groups.append({"params": no_decay, "weight_decay": 0.0})
     if not groups:

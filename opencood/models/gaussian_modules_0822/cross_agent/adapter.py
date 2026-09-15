@@ -15,23 +15,19 @@ DEFAULT_BOTTLENECK = 64
 class AgentResidualAdapter(nn.Module):
     """Bottleneck residual MLP, one independent set per agent.
 
-    Stage-2 (default): ``output = x + MLP_agent(x)``.
+    Stage-2 (``prenorm=False``, default): ``output = x + MLP(x)``.
 
-    Stage-3 mode (``gamma_init`` set): ``output = x + gamma * LN0(MLP(LN(x)))``
-    where ``LN0`` is a non-affine LayerNorm and ``gamma`` is a learnable
-    per-channel scale initialized to ``gamma_init``.
-
-    Args:
-        feature_dim: Gaussian feature width ``C``.
-        bottleneck: Bottleneck width.
-        gamma_init: If set, enable Stage-3 mode with this initial gamma.
+    Stage-3 (``prenorm=True``): standard PreNorm residual
+    ``output = x + MLP(LN(x))``. The old gated form
+    ``x + gamma * LN0(MLP(LN(x)))`` (learnable ``gamma``, output-side
+    non-affine LN) is removed; see git history to roll back.
     """
 
     def __init__(
         self,
         feature_dim: int = F90_CHANNELS,
         bottleneck: int = DEFAULT_BOTTLENECK,
-        gamma_init: Optional[float] = None,
+        prenorm: bool = False,
     ) -> None:
         super().__init__()
         width = int(feature_dim)
@@ -45,18 +41,12 @@ class AgentResidualAdapter(nn.Module):
                 for agent in AGENT_TYPES
             }
         )
-        self.scaled = gamma_init is not None
-        self.gamma: Optional[nn.Parameter]
+        self.prenorm = bool(prenorm)
         self.input_norm: Optional[nn.LayerNorm]
-        self.delta_norm: Optional[nn.LayerNorm]
-        if self.scaled:
-            self.gamma = nn.Parameter(torch.full((width,), float(gamma_init)))
+        if self.prenorm:
             self.input_norm = nn.LayerNorm(width)
-            self.delta_norm = nn.LayerNorm(width, elementwise_affine=False)
         else:
-            self.gamma = None
             self.input_norm = None
-            self.delta_norm = None
 
     def forward(self, feature: torch.Tensor, agent: str) -> torch.Tensor:
         """Residually adapt features in the last dimension.
@@ -67,11 +57,9 @@ class AgentResidualAdapter(nn.Module):
 
         Returns:
             Same shape as ``feature``. Stage-2: ``x + MLP(x)``. Stage-3:
-            ``x + gamma * LN0(MLP(LN(x)))``.
+            ``x + MLP(LN(x))``.
         """
         mlp = self.adapters[str(agent).lower()]
-        if self.input_norm is None or self.gamma is None or self.delta_norm is None:
+        if self.input_norm is None:
             return feature + mlp(feature)
-        delta = self.delta_norm(mlp(self.input_norm(feature)))
-        gamma = self.gamma.to(device=feature.device, dtype=feature.dtype)
-        return feature + gamma * delta
+        return feature + mlp(self.input_norm(feature))

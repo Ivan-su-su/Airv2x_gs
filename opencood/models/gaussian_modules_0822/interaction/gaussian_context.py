@@ -91,12 +91,10 @@ class GaussianContextInteraction(nn.Module):
         self.adapter = adapter or AgentResidualAdapter(
             feature_dim=feature_dim,
             bottleneck=adapter_bottleneck,
-            gamma_init=0.1,
+            prenorm=True,
         )
         self.self_fusion_norm = nn.LayerNorm(feature_dim)
         self.cross_fusion_norm = nn.LayerNorm(feature_dim)
-        self.fusion_delta_norm = nn.LayerNorm(feature_dim, elementwise_affine=False)
-        self.fusion_gamma = nn.Parameter(torch.full((int(feature_dim),), 0.1))
         self.fusion_mlp = nn.Linear(2 * feature_dim, feature_dim)
         self.splat = splat or GaussianBEVSplat(
             feature_dim=feature_dim,
@@ -161,9 +159,8 @@ class GaussianContextInteraction(nn.Module):
             [self.self_fusion_norm(self_out), self.cross_fusion_norm(cross_out)],
             dim=-1,
         )
-        delta = self.fusion_delta_norm(self.fusion_mlp(fusion_input))
-        gamma = self.fusion_gamma.to(device=delta.device, dtype=delta.dtype)
-        fused = pooled_feature + gamma * delta
+        delta = self.fusion_mlp(fusion_input)
+        fused = pooled_feature + delta
         out = merged.replace_feature(fused)
         return out, self.splat(out)
 

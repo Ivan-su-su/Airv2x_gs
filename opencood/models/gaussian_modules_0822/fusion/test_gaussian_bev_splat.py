@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import math
+
 import torch
 
 from opencood.models.gaussian_modules_0822.base.gaussian import GaussianSet
@@ -159,6 +161,102 @@ def test_feature_gradient() -> None:
     assert float(gs.feature.grad.abs().sum().item()) > 0.0
 
 
+def test_single_gaussian_preserves_radial_decay() -> None:
+    """A single Gaussian must keep its absolute Gaussian response.
+
+    With feature = 1 the BEV value at Mahalanobis distance d must equal
+    exp(-0.5 d^2). In particular a cell 2 sigma away must read
+    exp(-2) ~ 0.1353, NOT ~1 (which the old weight-normalized average
+    produced by computing (f * w) / w).
+    """
+    splat = _splat()  # cell 0.4 m, range [-8, 8]
+    # Cell center: (-8) + (ix + 0.5) * 0.4. ix=20 -> x = 0.2.
+    gs = GaussianSet(
+        mean=torch.tensor([[0.2, 0.2, 0.0]]),
+        scale=torch.ones(1, 3),
+        quaternion=torch.tensor([[1.0, 0.0, 0.0, 0.0]]),
+        feature=torch.ones(1, 1),
+        batch_index=torch.zeros(1, dtype=torch.long),
+        agent="vehicle",
+        frame="ego",
+    )
+    # Isotropic unit covariance: sigma_xy = 1 m, so 5 cells = 2 m = 2 sigma.
+    assert torch.allclose(
+        gs.covariance()[0, :2, :2], torch.eye(2), atol=1.0e-6
+    )
+    bev = splat(gs)[0, 0]
+    assert torch.isfinite(bev).all()
+    ix_center, iy_center = 20, 20
+    center = float(bev[iy_center, ix_center])
+    far = float(bev[iy_center, ix_center + 5])
+    expected = math.exp(-2.0)
+    assert center > far > 0.0, f"center {center:.4f} far {far:.4f}"
+    assert torch.allclose(
+        torch.tensor(center), torch.tensor(1.0), atol=1.0e-4, rtol=1.0e-3
+    ), f"center should be ~1, got {center}"
+    assert torch.allclose(
+        torch.tensor(far), torch.tensor(expected), atol=1.0e-4, rtol=1.0e-3
+    ), f"2-sigma should be exp(-2)={expected:.4f}, got {far}"
+
+
+def test_overlapping_gaussians_sum_contributions() -> None:
+    """Co-located Gaussians must add directly, not average.
+
+    Two identical Gaussians with features 1 and 2 give center output 3
+    under direct summation; the old normalized average gave
+    (1 + 2) / 2 = 1.5.
+    """
+    splat = _splat()
+    mean = torch.tensor([[0.2, 0.2, 0.0]])
+    scale = torch.ones(1, 3)
+    quat = torch.tensor([[1.0, 0.0, 0.0, 0.0]])
+    a = GaussianSet(
+        mean=mean,
+        scale=scale,
+        quaternion=quat,
+        feature=torch.ones(1, 1),
+        batch_index=torch.zeros(1, dtype=torch.long),
+        agent="vehicle",
+        frame="ego",
+    )
+    b = GaussianSet(
+        mean=mean.clone(),
+        scale=scale.clone(),
+        quaternion=quat.clone(),
+        feature=torch.full((1, 1), 2.0),
+        batch_index=torch.zeros(1, dtype=torch.long),
+        agent="vehicle",
+        frame="ego",
+    )
+    both = GaussianSet(
+        mean=torch.cat([mean, mean]),
+        scale=torch.cat([scale, scale]),
+        quaternion=torch.cat([quat, quat]),
+        feature=torch.tensor([[1.0], [2.0]]),
+        batch_index=torch.zeros(2, dtype=torch.long),
+        agent="vehicle",
+        frame="ego",
+    )
+    center_i, center_j = 20, 20
+    off_i, off_j = 20, 23  # 3 cells = 1.2 m = 1.2 sigma along x
+    va = float(splat(a)[0, 0, center_i, center_j])
+    vb = float(splat(b)[0, 0, center_i, center_j])
+    v_both = float(splat(both)[0, 0, center_i, center_j])
+    assert torch.allclose(
+        torch.tensor(v_both), torch.tensor(va + vb), atol=1.0e-4, rtol=1.0e-3
+    ), f"overlap must sum: {va} + {vb} != {v_both}"
+    assert torch.allclose(
+        torch.tensor(v_both), torch.tensor(3.0), atol=1.0e-4, rtol=1.0e-3
+    ), f"co-located 1 + 2 should give 3, got {v_both}"
+    # Off-center cell: identical distance to both, still sums with decay.
+    w_off = math.exp(-0.5 * 1.2 ** 2)
+    off = float(splat(both)[0, 0, off_i, off_j])
+    assert torch.allclose(
+        torch.tensor(off), torch.tensor(3.0 * w_off), atol=1.0e-4, rtol=1.0e-3
+    ), f"off-center should be 3 * exp(-0.5*1.44)={3.0 * w_off:.4f}, got {off}"
+    assert off < v_both
+
+
 if __name__ == "__main__":
     test_isotropic_quaternion_invariant()
     test_horizontal_anisotropic_follows_quaternion()
@@ -166,4 +264,6 @@ if __name__ == "__main__":
     test_sigma_xy_matches_gaussian_covariance()
     test_outlier_does_not_expand_all_neighborhoods()
     test_feature_gradient()
+    test_single_gaussian_preserves_radial_decay()
+    test_overlapping_gaussians_sum_contributions()
     print("gaussian_bev_splat tests ok")

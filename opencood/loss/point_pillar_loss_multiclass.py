@@ -79,8 +79,15 @@ class PointPillarLossMultiClass(nn.Module):
     def __init__(self, args):
         super(PointPillarLossMultiClass, self).__init__()
         self.reg_loss_func = WeightedSmoothL1Loss()
-        self.alpha = 0.25
-        self.gamma = 2.0
+        # Focal alpha / gamma for the cls head. Defaults keep the
+        # historical hardcoded values (0.25 / 2.0); overridable via YAML.
+        self.alpha = args.get("alpha", 0.25)
+        self.gamma = args.get("gamma", 2.0)
+        # Objectness focal alpha / gamma, fully separate from the cls
+        # alpha / gamma above. obj_fg_weight / obj_bg_weight belong to the
+        # retired separate-normalization obj loss and are no longer read.
+        self.obj_alpha = args.get("obj_alpha", 0.25)
+        self.obj_gamma = args.get("obj_gamma", 2.0)
 
         self.cls_weight = args["cls_weight"]
         self.reg_coe = args["reg"]
@@ -159,17 +166,67 @@ class PointPillarLossMultiClass(nn.Module):
         reg_loss = loc_loss_src.sum() / rm.shape[0]
         reg_loss *= self.reg_coe
 
-        # objectness loss using Focal Loss (reuse obj_loss_func)
-        obj_preds_expanded = obj_preds.unsqueeze(-1)  # [B, H, W, A] -> [B, H, W, A, 1]
-        pos_mask_expanded = pos_mask.unsqueeze(-1).float()  # [B, H, W, A] -> [B, H, W, A, 1]
-        obj_loss_src = self.obj_loss_func(
-            obj_preds_expanded,  # input: logits
-            pos_mask_expanded,   # target: 0/1
-            torch.ones_like(pos_mask_expanded)  # weights: all ones
+        # Objectness focal loss over VALID anchors only (pos=1 or neg=1).
+        # Ignore anchors (pos=0 and neg=0) contribute exactly zero.
+        # Normalization is num_pos per sample (NOT num_neg / valid count),
+        # and alpha_t flips so easy negatives (p ~ 0) are suppressed by
+        # pt^gamma. Uses obj_alpha / obj_gamma, fully separate from the
+        # cls alpha / gamma.
+        pos_mask = pos_mask.to(device=obj_preds.device, dtype=obj_preds.dtype)
+        neg_mask = neg_mask.to(device=obj_preds.device, dtype=obj_preds.dtype)
+        valid_mask = (pos_mask + neg_mask).clamp(max=1.0)
+
+        target = pos_mask
+        bce = F.binary_cross_entropy_with_logits(
+            obj_preds, target, reduction="none"
         )
-        # Use mean (same as original implementation)
-        obj_loss = obj_loss_src.mean()
-        obj_loss_weighted = obj_loss * self.obj_weight
+        p = torch.sigmoid(obj_preds)
+        alpha_t = (
+            target * self.obj_alpha
+            + (1.0 - target) * (1.0 - self.obj_alpha)
+        )
+        pt_error = (
+            target * (1.0 - p)
+            + (1.0 - target) * p
+        )
+        focal_weight = (
+            alpha_t
+            * pt_error.pow(self.obj_gamma)
+        )
+
+        obj_loss_raw = (
+            focal_weight
+            * bce
+            * valid_mask
+        )
+
+        num_pos = pos_mask.sum(
+            dim=(1, 2, 3)
+        ).clamp(min=1.0)
+
+        obj_loss = (
+            obj_loss_raw.sum(dim=(1, 2, 3))
+            / num_pos
+        ).mean()
+
+        obj_loss_weighted = (
+            obj_loss
+            * self.obj_weight
+        )
+
+        # Read-only diagnostics: positive vs negative objectness separation.
+        with torch.no_grad():
+            obj_prob = torch.sigmoid(obj_preds)
+            pos_count = pos_mask.sum()
+            neg_count = neg_mask.sum()
+            pos_mean_prob = (
+                (obj_prob * pos_mask).sum()
+                / pos_count.clamp(min=1.0)
+            )
+            neg_mean_prob = (
+                (obj_prob * neg_mask).sum()
+                / neg_count.clamp(min=1.0)
+            )
 
         total_loss = reg_loss + conf_loss + obj_loss_weighted
 
@@ -222,6 +279,11 @@ class PointPillarLossMultiClass(nn.Module):
                 "conf_loss{}".format(prefix): conf_loss.item(),
             "obj_loss{}".format(prefix): obj_loss_weighted.item(),
             }
+        # Read-only objectness diagnostics (never in total_loss).
+        loss_dict_update["obj_pos_count{}".format(prefix)] = float(pos_count.item())
+        loss_dict_update["obj_neg_count{}".format(prefix)] = float(neg_count.item())
+        loss_dict_update["obj_pos_mean_prob{}".format(prefix)] = float(pos_mean_prob.item())
+        loss_dict_update["obj_neg_mean_prob{}".format(prefix)] = float(neg_mean_prob.item())
         # Always record recall_loss and iou_loss if weights are set, even if 0
         if self.recall_weight > 0:
             if isinstance(recall_loss_weighted, torch.Tensor):

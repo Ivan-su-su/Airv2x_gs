@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from typing import Any, Dict, Tuple
 
 import torch
@@ -123,7 +124,7 @@ class Airv2xGaussian0822(nn.Module):
         stage2_adapter = AgentResidualAdapter(feature_dim=F90_CHANNELS)
         stage3_adapter = AgentResidualAdapter(
             feature_dim=F90_CHANNELS,
-            gamma_init=0.1,
+            prenorm=True,
         )
         attn_cfg = args.get("gaussian_attention") or {}
         self.intra_view = IntraViewInteraction(
@@ -162,6 +163,28 @@ class Airv2xGaussian0822(nn.Module):
             out_c, 7 * int(args["anchor_number"]), kernel_size=1
         )
         self.obj_head = nn.Conv2d(out_c, int(args["anchor_number"]), kernel_size=1)
+        # Low foreground prior for fresh detector training: the obj head
+        # starts predicting p ~ obj_prior_prob instead of p ~ 0.5, so the
+        # focal loss does not start from a large negative- dominated
+        # logit regime. The P1 frontend checkpoint (verified statically)
+        # contains no obj_head keys, so this init is never overwritten by
+        # _load_and_freeze_frontend; resuming a full net_epoch*.pth later
+        # naturally overrides it.
+        obj_prior_prob = float(
+            args.get("obj_prior_prob", 0.01)
+        )
+        if not 0.0 < obj_prior_prob < 1.0:
+            raise ValueError(
+                f"obj_prior_prob must be in (0,1), got {obj_prior_prob}"
+            )
+        obj_bias = math.log(
+            obj_prior_prob
+            / (1.0 - obj_prior_prob)
+        )
+        nn.init.constant_(
+            self.obj_head.bias,
+            obj_bias,
+        )
         if self.vehicle_p1_v45:
             pretrained = args.get("pretrained_v45") or args["pretrained"]
             print("[V45] Vehicle P1 stride-8 45x80; RSU/Drone stay 90x160")

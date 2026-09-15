@@ -2,7 +2,7 @@
 # Name #
 ########
 
-name: airv2x_gaussian_0822_camera
+name: airv2x_gaussian_0822_objfocal
 
 
 ############
@@ -21,9 +21,9 @@ train_params:
   eval_freq: 2
   save_freq: 1
   max_cav: &max_cav
-    vehicle: 5
-    rsu: 5
-    drone: 5
+    vehicle: 3
+    rsu: 2
+    drone: 2
 
 device: &device cuda
 train: &train True
@@ -263,6 +263,8 @@ model:
     cav_range: *cav_lidar
     seg_res: *seg_res
     obj_head: true
+    # Fresh-run prior for the obj_head bias (logit = log(p/(1-p))).
+    obj_prior_prob: 0.01
 
     gaussian_range_filter:
       enabled: true
@@ -296,7 +298,7 @@ model:
       stage3_cross_layers: 1
 
     gaussian_stage3:
-      voxel_size: [0.4, 0.4, 0.125]
+      voxel_size: [0.4, 0.4, 0.125] 
       point_cloud_range: *cav_lidar
       adapter_bottleneck: 64
       bev_n_sigma: 3.0
@@ -311,12 +313,15 @@ loss:
     core_method: point_pillar_loss_multiclass
     args:
       cls_weight: 1.0
-      # Focal alpha/gamma for the cls (psm) branch.
+      # Focal alpha/gamma for the cls (psm) branch (unchanged).
       alpha: 0.25
       gamma: 2.0
-      obj_weight: 2.0
-      iou_weight: 0.5
+      # Objectness binary focal loss (separate alpha/gamma from cls).
+      obj_weight: 1.0
+      obj_alpha: 0.25
+      obj_gamma: 2.0
       reg: 2.0
+      iou_weight: 0.5
       num_class: *num_class
 
 

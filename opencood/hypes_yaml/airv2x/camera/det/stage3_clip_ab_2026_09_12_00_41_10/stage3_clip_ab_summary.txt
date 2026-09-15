@@ -1,0 +1,25 @@
+Stage3 Clipping A/B Test
+========================================================================
+A GPU4: Stage3 core WD=0, max_norm=1.0
+B GPU5: Stage3 core WD=0, max_norm=20.0
+Identical Stage3 initial hash: True
+
+Final parameter retention
+  stage3.self_blocks.0.q_proj.weight: A=1.1053, B=1.0405
+  stage3.cross_blocks.0.q_proj.weight: A=1.1038, B=1.0447
+  stage3.self_blocks.0.ffn.2.weight: A=1.0810, B=1.0597
+  stage3.cross_blocks.0.ffn.2.weight: A=1.0829, B=1.0602
+  stage3.fusion_mlp.weight: A=1.0711, B=1.0614
+
+Fusion / gradient
+  fusion_gamma mean|x|: A=0.1007, B=0.1025
+  Stage3 grad L2:       A=0.0012, B=0.0062
+  pre-clip grad L2:     A=17.6156, B=17.0987
+  clip factor:          A=0.0568, B=1.0000
+  last logged loss:     A=3.6066, B=3.6733
+
+AUTOMATED INTERPRETATION
+------------------------------------------------------------------------
+CLIP1_STRONGLY_SUPPRESSES_STAGE3_LEARNING
+Both keep Stage3 weights alive because WD=0, but max_norm=20 preserves substantially larger Stage3 task gradients.
+
