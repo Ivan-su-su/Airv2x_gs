@@ -31,6 +31,8 @@ class WeightedSmoothL1Loss(nn.Module):
         """
         super(WeightedSmoothL1Loss, self).__init__()
         self.beta = beta
+        # None until constructed; kept as attribute so forward can check.
+        self.code_weights = None
         if code_weights is not None:
             self.code_weights = np.array(code_weights, dtype=np.float32)
             self.code_weights = torch.from_numpy(self.code_weights).cuda()
@@ -65,6 +67,11 @@ class WeightedSmoothL1Loss(nn.Module):
         diff = input - target
         loss = self.smooth_l1_loss(diff, self.beta)
 
+        # code-wise weighting (e.g. XY up-weighting), applied after the
+        # SmoothL1 so target/decode definitions stay untouched.
+        if self.code_weights is not None:
+            loss = loss * self.code_weights.view(1, 1, -1).to(loss.device)
+
         # anchor-wise weighting
         if weights is not None:
             assert (
@@ -78,7 +85,6 @@ class WeightedSmoothL1Loss(nn.Module):
 class PointPillarLossMultiClass(nn.Module):
     def __init__(self, args):
         super(PointPillarLossMultiClass, self).__init__()
-        self.reg_loss_func = WeightedSmoothL1Loss()
         # Focal alpha / gamma for the cls head. Defaults keep the
         # historical hardcoded values (0.25 / 2.0); overridable via YAML.
         self.alpha = args.get("alpha", 0.25)
@@ -91,8 +97,18 @@ class PointPillarLossMultiClass(nn.Module):
 
         self.cls_weight = args["cls_weight"]
         self.reg_coe = args["reg"]
+        # Per-regression-code weights applied to the SmoothL1 loss, e.g.
+        # [1.5, 1.5, 1, 1, 1, 1, 1] up-weights x/y codes. Code order is
+        # [x, y, z, h, w, l, yaw]; target/decode definitions unchanged.
+        self.reg_code_weights = args.get("reg_code_weights", None)
+        self.reg_loss_func = WeightedSmoothL1Loss(
+            code_weights=self.reg_code_weights
+        )
         self.obj_weight = args.get("obj_weight", 1.0)
         self.iou_weight = args.get("iou_weight", 0.0)  # 0.0 means disabled
+        # Quality head supervision: BCEWithLogits against the BEV IoU
+        # between predicted box and matched GT, positives only.
+        self.quality_weight = args.get("quality_weight", 0.0)  # 0.0 means disabled
         self.recall_weight = args.get("recall_weight", 0.0)  # 0.0 means disabled, for encouraging more detections
         self.flow_weight = args["flow_weight"] if "flow_weight" in args else 1.0
         self.loss_dict = {}
@@ -273,6 +289,24 @@ class PointPillarLossMultiClass(nn.Module):
                     iou_loss_weighted = iou_loss * self.iou_weight
                     total_loss = total_loss + iou_loss_weighted
 
+        # Quality loss (optional, only if quality_weight > 0). BCEWithLogits
+        # of quality logits vs. the BEV IoU between predicted box and
+        # matched GT, positives only, normalized by Npos.
+        quality_loss_weighted = 0.0
+        if self.quality_weight > 0:
+            quality_logits_full = output_dict.get("quality{}".format(prefix), None)
+            anchor_box = target_dict.get("anchor_box", None)
+            if anchor_box is None:
+                anchor_box = output_dict.get("anchor_box", None)
+            quality_loss_weighted, quality_loss = self._quality_loss(
+                quality_logits_full,
+                rm,
+                targets,
+                positives,
+                anchor_box,
+            )
+            total_loss = total_loss + quality_loss_weighted
+
         loss_dict_update = {
                 "total_loss{}".format(prefix): total_loss.item(),
                 "reg_loss{}".format(prefix): reg_loss.item(),
@@ -295,6 +329,11 @@ class PointPillarLossMultiClass(nn.Module):
                 loss_dict_update["iou_loss{}".format(prefix)] = iou_loss_weighted.item()
             else:
                 loss_dict_update["iou_loss{}".format(prefix)] = float(iou_loss_weighted)
+        if self.quality_weight > 0:
+            if isinstance(quality_loss_weighted, torch.Tensor):
+                loss_dict_update["quality_loss{}".format(prefix)] = quality_loss_weighted.item()
+            else:
+                loss_dict_update["quality_loss{}".format(prefix)] = float(quality_loss_weighted)
         self.loss_dict.update(loss_dict_update)
 
         return total_loss
@@ -446,6 +485,57 @@ class PointPillarLossMultiClass(nn.Module):
         boxes[:, 6] = pos_deltas[:, 6] + pos_anchors[:, 6]
         
         return boxes
+
+    def _quality_loss(
+        self,
+        quality_logits: torch.Tensor,
+        rm_flat: torch.Tensor,
+        targets_flat: torch.Tensor,
+        positives: torch.Tensor,
+        anchor_box: torch.Tensor,
+    ):
+        """Quality head loss: BCEWithLogits vs. pred-GT BEV IoU, positives only.
+
+        Args:
+            quality_logits: [B, A, H, W] raw quality logits from the
+                quality head (conv layout, no permutation yet).
+            rm_flat: [B, H*W*A, 7] regression predictions (post-permute).
+            targets_flat: [B, H*W*A, 7] regression targets (post-view).
+            positives: [B, H*W*A] bool positive mask.
+            anchor_box: [H, W, A, 7] or [H*W*A, 7] anchors.
+
+        Returns:
+            (weighted_loss, raw_loss): weighted = raw * quality_weight;
+            both are python float 0.0 when disabled/empty.
+        """
+        if quality_logits is None or positives.sum() == 0 or anchor_box is None:
+            return 0.0, 0.0
+
+        # [B, A, H, W] -> [B, H, W, A] -> [B, H*W*A], matching the
+        # rm/obj flatten order (permute(0,2,3,1) on the conv output).
+        q = quality_logits.permute(0, 2, 3, 1).contiguous().view(-1)
+        pos_mask_flat = positives.view(-1)
+        quality_pred = q[pos_mask_flat]  # [Npos]
+
+        # Decode predicted and GT boxes for positives (same decode as
+        # the IoU loss branch), then take BEV IoU as the quality target.
+        pred_boxes = self._decode_delta_to_boxes(rm_flat, anchor_box, positives)
+        gt_boxes = self._decode_delta_to_boxes(targets_flat, anchor_box, positives)
+        if pred_boxes.shape[0] == 0 or pred_boxes.shape[0] != gt_boxes.shape[0]:
+            return 0.0, 0.0
+
+        from opencood.utils.iou3d_nms import iou3d_nms_utils
+
+        # BEV IoU in [0, 1]; detached: target must not backprop into rm.
+        with torch.no_grad():
+            quality_target = iou3d_nms_utils.paired_boxes_iou3d_gpu(
+                pred_boxes.float(), gt_boxes.float()
+            ).clamp(0.0, 1.0)
+
+        quality_loss = F.binary_cross_entropy_with_logits(
+            quality_pred, quality_target
+        )  # mean over Npos
+        return quality_loss * self.quality_weight, quality_loss
 
     @staticmethod
     def add_sin_difference(boxes1, boxes2, dim=6):

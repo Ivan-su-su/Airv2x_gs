@@ -709,6 +709,7 @@ class VoxelPostprocessor(BasePostprocessor):
         pred_box2d_list = []
         pred_label_list = []
         boxes3d_list = [] # saving unprojected boxes3d
+        nms_quality_list = [] # per-cav quality for obj*quality NMS ranking
 
         C = self.num_class # num of classes
         Nanchor = self.anchor_num  # number of anchor per location
@@ -764,7 +765,7 @@ class VoxelPostprocessor(BasePostprocessor):
             score_mean = class_scores.mean().item()
             score_max = class_scores.max().item()
             score_min = class_scores.min().item()
-            
+
             if total_candidates > 1000:  # 只打印大量候选框的情况
                 print(f"[post_process_airv2x] 过滤统计: 总候选={total_candidates}, "
                       f"objectness过滤后={obj_filtered}, class_scores过滤后={score_filtered}, "
@@ -782,6 +783,19 @@ class VoxelPostprocessor(BasePostprocessor):
 
             if mask.sum() == 0:
                 continue
+
+            # Quality map for quality-aware NMS: sigmoid(quality logits),
+            # flattened with the exact same order as obj (permute(0,2,3,1)).
+            # Old checkpoints without a quality head simply skip this and
+            # fall back to objectness-only NMS ranking.
+            if "quality" in output_dict[cav_id]:
+                quality_logits = output_dict[cav_id]["quality"]  # [1, A, H, W]
+                quality_map = torch.sigmoid(
+                    quality_logits.permute(0, 2, 3, 1).contiguous()
+                ).view(1, -1)  # [1, N] same order as objectness
+                quality3d = torch.masked_select(quality_map[0], mask[0])
+            else:
+                quality3d = None
 
             # regression map
             reg = output_dict[cav_id]["rm"]
@@ -820,6 +834,9 @@ class VoxelPostprocessor(BasePostprocessor):
                 pred_box3d_list.append(projected_boxes3d)
                 pred_label_list.append(labels3d)
                 boxes3d_list.append(boxes3d)
+                nms_quality_list.append(
+                    quality3d if quality3d is not None else torch.ones_like(scores3d)
+                )
         
         cav_process_end = time.time()
         print(f"[post_process_airv2x] CAV处理循环时间: {cav_process_end - cav_process_start:.4f} 秒")
@@ -859,6 +876,7 @@ class VoxelPostprocessor(BasePostprocessor):
         pred_box3d_tensor = torch.vstack(pred_box3d_list)
         labels = torch.cat(pred_label_list)
         boxes3d = torch.cat(boxes3d_list)
+        nms_qualities = torch.cat(nms_quality_list)  # aligned with scores
         concat_end = time.time()
         print(f"[post_process_airv2x] 拼接结果时间 (boxes: {len(pred_box3d_tensor)}): {concat_end - concat_start:.4f} 秒")
 
@@ -876,14 +894,19 @@ class VoxelPostprocessor(BasePostprocessor):
         scores = scores[keep_index]
         labels = labels[keep_index]
         boxes3d = boxes3d[keep_index]
+        nms_qualities = nms_qualities[keep_index]
         filter_end = time.time()
         print(f"[post_process_airv2x] 预过滤时间 (剩余: {len(pred_box3d_tensor)} boxes): {filter_end - filter_start:.4f} 秒")
 
         # Rotated NMS
+        # Quality-aware ranking: NMS orders by objectness * quality, but the
+        # returned/AP-facing score stays objectness. quality==1 fallback
+        # (old checkpoints) reproduces the original objectness-only NMS.
         nms_start = time.time()
         nms_input_count = len(pred_box3d_tensor)
+        nms_scores = scores * nms_qualities
         keep_index = box_utils.nms_rotated(
-            pred_box3d_tensor, scores, self.params["nms_thresh"]
+            pred_box3d_tensor, nms_scores, self.params["nms_thresh"]
         )
         pred_box3d_tensor = pred_box3d_tensor[keep_index]
         scores = scores[keep_index]

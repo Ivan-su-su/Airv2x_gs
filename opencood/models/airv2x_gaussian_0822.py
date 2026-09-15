@@ -163,6 +163,13 @@ class Airv2xGaussian0822(nn.Module):
             out_c, 7 * int(args["anchor_number"]), kernel_size=1
         )
         self.obj_head = nn.Conv2d(out_c, int(args["anchor_number"]), kernel_size=1)
+        # Quality head: one IoU-quality logit per anchor, used only to
+        # rank overlapping boxes inside NMS (never replaces obj score).
+        self.quality_head = nn.Conv2d(
+            out_c, int(args["anchor_number"]), kernel_size=1
+        )
+        nn.init.normal_(self.quality_head.weight, std=0.01)
+        nn.init.constant_(self.quality_head.bias, 0.0)
         # Low foreground prior for fresh detector training: the obj head
         # starts predicting p ~ obj_prior_prob instead of p ~ 0.5, so the
         # focal loss does not start from a large negative- dominated
@@ -321,4 +328,5 @@ class Airv2xGaussian0822(nn.Module):
             "psm": self.cls_head(fused),
             "rm": self.reg_head(fused),
             "obj": self.obj_head(fused),
+            "quality": self.quality_head(fused),
         }
