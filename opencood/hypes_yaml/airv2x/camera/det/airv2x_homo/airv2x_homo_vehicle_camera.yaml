@@ -1,23 +1,23 @@
-# AirV2X HEAL heterogeneous collab. Loads the three shared Stage-0 bases.
+# Homogeneous Stage-0 vehicle base. Train once, reuse for HEAL / STAMP / NegoCollab.
 inherit_from: opencood/hypes_yaml/airv2x/camera/det/_shared_camera_det.yaml
 yaml_parser: "load_airv2x_heter_params"
 
-name: airv2x_HEAL_collab_camera
-collaborators: ["vehicle", "rsu", "drone"]
+name: airv2x_homo_vehicle_camera
+collaborators: ["vehicle"]
 ego_type: vehicle
 
 train_params:
   max_cav:
     vehicle: 3
-    rsu: 2
-    drone: 2
+    rsu: 0
+    drone: 0
 
 model:
-  core_method: airv2x_heal
+  core_method: airv2x_homo_base
   args:
-    collaborators: ["vehicle", "rsu", "drone"]
+    collaborators: ["vehicle"]
+    homo_agent_type: vehicle
     freeze_lss: true
     freeze_bev_backbone: false
     freeze_fusion: false
     freeze_heads: false
-    assembled_inference: false

@@ -12,6 +12,83 @@ import numpy as np
 import yaml
 
 
+def _deep_update(base, override):
+    """Recursively update nested dictionaries. Lists / scalars are replaced."""
+    import copy
+
+    result = copy.deepcopy(base)
+    for key, value in override.items():
+        if (
+            key in result
+            and isinstance(result[key], dict)
+            and isinstance(value, dict)
+        ):
+            result[key] = _deep_update(result[key], value)
+        else:
+            result[key] = copy.deepcopy(value)
+    return result
+
+
+def _resolve_yaml_path(path):
+    if os.path.isabs(path) and os.path.exists(path):
+        return path
+    if os.path.exists(path):
+        return os.path.abspath(path)
+    here = os.path.dirname(os.path.abspath(__file__))
+    repo_root = os.path.abspath(os.path.join(here, "..", ".."))
+    candidates = [
+        os.path.join(repo_root, path),
+        os.path.join(here, path),
+        os.path.join(os.getcwd(), path),
+    ]
+    for cand in candidates:
+        if os.path.exists(cand):
+            return cand
+    raise FileNotFoundError(f"Cannot resolve inherit_from yaml: {path}")
+
+
+def _load_yaml_raw(file):
+    stream = open(file, "r")
+    loader = yaml.Loader
+    loader.add_implicit_resolver(
+        "tag:yaml.org,2002:float",
+        re.compile(
+            """^(?:
+         [-+]?(?:[0-9][0-9_]*)\\.[0-9_]*(?:[eE][-+]?[0-9]+)?
+        |[-+]?(?:[0-9][0-9_]*)(?:[eE][-+]?[0-9]+)
+        |\\.[0-9_]+(?:[eE][-+][0-9]+)?
+        |[-+]?[0-9][0-9_]*(?::[0-5]?[0-9])+\\.[0-9_]*
+        |[-+]?\\.(?:inf|Inf|INF)
+        |\\.(?:nan|NaN|NAN))$""",
+            re.X,
+        ),
+        list("-+0123456789."),
+    )
+    return yaml.load(stream, Loader=loader)
+
+
+def load_airv2x_heter_params(param):
+    """Load AirV2X heter configs, optionally inheriting a shared YAML.
+
+    Child files may set::
+
+        inherit_from: opencood/hypes_yaml/airv2x/camera/det/_shared_camera_det.yaml
+        yaml_parser: "load_airv2x_heter_params"
+    """
+    inherit = param.pop("inherit_from", None)
+    seen = set()
+    while inherit:
+        resolved = _resolve_yaml_path(inherit)
+        if resolved in seen:
+            raise RuntimeError(f"Cyclic inherit_from: {resolved}")
+        seen.add(resolved)
+        base = _load_yaml_raw(resolved)
+        inherit = base.pop("inherit_from", None)
+        base.pop("yaml_parser", None)
+        param = _deep_update(base, param)
+    return load_airv2x_params(param)
+
+
 def load_yaml(file, opt=None, model_dir = None):
     """
     Load yaml file and return a dictionary.

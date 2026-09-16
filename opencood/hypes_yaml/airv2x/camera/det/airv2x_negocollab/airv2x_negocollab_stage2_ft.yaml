@@ -1,0 +1,29 @@
+# NegoCollab Stage 2: freeze local bases + senders, train receiver-side modules.
+inherit_from: opencood/hypes_yaml/airv2x/camera/det/airv2x_negocollab/airv2x_negocollab_stage1_nego.yaml
+yaml_parser: "load_airv2x_heter_params"
+
+name: airv2x_negocollab_stage2_ft
+
+train_params:
+  batch_size: 1
+  epoches: 9
+  eval_freq: 1
+  save_freq: 1
+  max_cav:
+    vehicle: 3
+    rsu: 2
+    drone: 2
+
+model:
+  core_method: airv2x_negocollab
+  args:
+    stage: ft
+
+loss:
+  det:
+    core_method: airv2x_negocollab_loss
+    args:
+      stage: ft
+      num_class: 7
+      cls_weight: 1.0
+      reg: 2.0

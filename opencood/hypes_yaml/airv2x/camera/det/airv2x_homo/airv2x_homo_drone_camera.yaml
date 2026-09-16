@@ -1,0 +1,29 @@
+# Homogeneous Stage-0 drone base. Train once, reuse for HEAL / STAMP / NegoCollab.
+inherit_from: opencood/hypes_yaml/airv2x/camera/det/_shared_camera_det.yaml
+yaml_parser: "load_airv2x_heter_params"
+
+name: airv2x_homo_drone_camera
+collaborators: ["drone"]
+ego_type: drone
+
+train_params:
+  max_cav:
+    vehicle: 0
+    rsu: 0
+    drone: 2
+
+preprocess:
+  ego_type: drone
+
+postprocess:
+  ego_type: drone
+
+model:
+  core_method: airv2x_homo_base
+  args:
+    collaborators: ["drone"]
+    homo_agent_type: drone
+    freeze_lss: true
+    freeze_bev_backbone: false
+    freeze_fusion: false
+    freeze_heads: false

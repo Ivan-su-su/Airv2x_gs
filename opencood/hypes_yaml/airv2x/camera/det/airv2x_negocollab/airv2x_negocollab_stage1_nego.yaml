@@ -1,0 +1,106 @@
+# NegoCollab Stage 1: freeze local bases, train sender / negotiator / receiver.
+inherit_from: opencood/hypes_yaml/airv2x/camera/det/_shared_camera_det.yaml
+yaml_parser: "load_airv2x_heter_params"
+
+name: airv2x_negocollab_stage1_nego
+collaborators: ["vehicle", "rsu", "drone"]
+ego_type: vehicle
+
+train_params:
+  batch_size: 1
+  epoches: 12
+  eval_freq: 1
+  save_freq: 1
+  max_cav:
+    vehicle: 3
+    rsu: 2
+    drone: 2
+
+model:
+  core_method: airv2x_negocollab
+  args:
+    collaborators: ["vehicle", "rsu", "drone"]
+    stage: nego
+    ego_type: vehicle
+    freeze_lss: true
+    pub: &pub
+      C_uni: &C_uni 64
+      granularity_H: &gra_H 0.8
+      granularity_W: &gra_W 0.8
+      in_head: 64
+      negotiator:
+        dim: *C_uni
+        inplanes: *C_uni
+        backbone_args:
+          resnext: true
+          inplanes: *C_uni
+          layer_nums: [3, 4]
+          layer_strides: [1, 2]
+          num_filters: [64, 64]
+          upsample_strides: [1, 2]
+          num_upsample_filter: [64, 64]
+          anchor_number: 2
+        shrink_header_args:
+          kernal_size: [3]
+          stride: [1]
+          padding: [1]
+          dim: [*C_uni]
+          input_dim: 128
+    vehicle:
+      local_dim: 64
+      aligner:
+        core_method: identity
+      comm_args: &comm_args
+        unify_parameters:
+          C_uni: *C_uni
+          granularity_H: *gra_H
+          granularity_W: *gra_W
+        resizer:
+          method: conv
+          local_dim: 64
+        recombiner:
+          core_method: convnext
+          spatial_align: false
+          args:
+            num_of_blocks: 2
+            dim: *C_uni
+        converter:
+          num_of_blocks: 1
+          dim: *C_uni
+          window_size: 8
+          heads: 4
+          drop_out: 0.1
+        prompt_generator:
+          core_method: cbam
+          args:
+            dim: *C_uni
+            num_of_blocks: 1
+    rsu:
+      local_dim: 64
+      aligner:
+        core_method: identity
+      comm_args: *comm_args
+    drone:
+      local_dim: 64
+      aligner:
+        core_method: identity
+      comm_args: *comm_args
+
+loss:
+  det:
+    core_method: airv2x_negocollab_loss
+    args:
+      stage: nego
+      cycle_ratio: 1.0
+      unify_dis_ratio: 1.0
+      pragma_ratio: 0.5
+      num_class: 7
+      cls_weight: 1.0
+      reg: 2.0
+
+optimizer:
+  core_method: Adam
+  lr: 0.001
+  args:
+    eps: 1e-10
+    weight_decay: 1e-4

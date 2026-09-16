@@ -1,186 +1,102 @@
-""" Author: Yifan Lu <yifan_lu@sjtu.edu.cn>
+"""AirV2X HEAL: three agent-specific frozen LSS encoders + shared vehicle-domain detector."""
 
-HEAL: An Extensible Framework for Open Heterogeneous Collaborative Perception 
-"""
+from __future__ import annotations
 
-import torch
-import torch.nn as nn
-import numpy as np
-from icecream import ic
-import torchvision
-from collections import OrderedDict, Counter
+from typing import Any, Dict
+
+from opencood.models.airv2x_detector_parts import Airv2xSharedDetector
 from opencood.models.common_modules.airv2x_base_model import Airv2xBase
-from opencood.models.common_modules.base_bev_backbone_resnet import ResNetBEVBackbone
-from opencood.models.fuse_modules.pyramid_fuse import PyramidFusion
-from opencood.models.sub_modules.feature_alignnet import AlignNet
-from opencood.models.sub_modules.downsample_conv import DownsampleConv
-from opencood.models.task_heads.segmentation_head import BevSegHead
-import importlib
-# from opencood.utils.model_utils import check_trainable_module, fix_bn, unfix_bn
+from opencood.utils.airv2x_freeze import apply_named_freeze_policy, assert_lss_frozen
+
 
 class Airv2xHEAL(Airv2xBase):
-    def __init__(self, args):
-        super(Airv2xHEAL, self).__init__(args)
-        
-        self.args = args
+    """AirV2X adaptation of HEAL.
 
-        # here we use image encoder LSS instead of lidar
+    Graph::
+
+        Vehicle LSS ─┐
+        RSU LSS ─────┼→ shared BEV backbone (vehicle domain)
+        Drone LSS ───┘
+                         ↓
+                 shared PyramidFusion
+                         ↓
+                    shared heads
+
+    Stage-0 initialization is explicit (not load-order dependent):
+
+    * `veh_models` ← vehicle base encoder
+    * `rsu_models` ← rsu base encoder
+    * `drone_models` ← drone base encoder
+    * shared backbone / fusion / heads ← vehicle base
+    """
+
+    def __init__(self, args: Dict[str, Any]) -> None:
+        super().__init__(args)
+        self.args = args
         self.collaborators = args["collaborators"]
         self.active_sensors = args["active_sensors"]
-        
         self.init_encoders(args)
-        modality_args = args["modality_fusion"]
-        self.backbone = ResNetBEVBackbone(modality_args["base_bev_backbone"], 64)
-        
-        # used to downsample the feature map for efficient computation
-        self.shrink_flag = False
-        if "shrink_header" in modality_args and modality_args["shrink_header"]["use"]:
-            self.shrink_flag = True
-            self.shrink_conv = DownsampleConv(modality_args["shrink_header"])
-        self.compression = False
 
-        if modality_args["compression"] > 0:
-            self.compression = True
-            self.naive_compressor = NaiveCompressor(256, args["compression"])
-            
-        self.pyramid_backbone = PyramidFusion(args["fusion_backbone"])
+        self.detector = Airv2xSharedDetector(args)
+        self.backbone = self.detector.backbone
+        self.pyramid_backbone = self.detector.pyramid_backbone
+        self.shrink_flag = self.detector.shrink_flag
+        self.shrink_conv = self.detector.shrink_conv
+        self.cls_head = self.detector.cls_head
+        self.reg_head = self.detector.reg_head
+        self.obj_head = self.detector.obj_head
+        self.seg_head = self.detector.seg_head
 
-        """
-        Shared Heads, Would load from pretrain base.
-        """
-        if args["task"] == "det":
-            self.cls_head = nn.Conv2d(args['in_head'], args['anchor_number'] * args["num_class"],
-                                    kernel_size=1)
-            self.reg_head = nn.Conv2d(args['in_head'], 7 * args['anchor_number'],
-                                    kernel_size=1)
-            if args["obj_head"]:
-                self.obj_head = nn.Conv2d(
-                    args['in_head'], args["anchor_number"], kernel_size=1
-                )
-        elif args["task"] == "seg":
-            self.seg_head = BevSegHead(
-                args["seg_branch"], args["seg_hw"], args["seg_hw"], args['in_head'], args["dynamic_class"], args["static_class"],
-                seg_res=args["seg_res"], cav_range=args["cav_range"]
+        # `backbone_fix` is legacy. Prefer explicit freeze_* flags.
+        legacy_fix = args.get("backbone_fix", False)
+        freeze_bev = bool(args.get("freeze_bev_backbone", False))
+        freeze_fusion = bool(args.get("freeze_fusion", False))
+        freeze_heads = bool(args.get("freeze_heads", False))
+        if legacy_fix and not any(
+            k in args for k in ("freeze_bev_backbone", "freeze_fusion", "freeze_heads")
+        ):
+            # Legacy HEAL collab used backbone_fix to freeze RSU/Drone LSS
+            # AND the shared detector. LSS is always frozen now; keep the
+            # shared detector trainable unless freeze_* is set.
+            print(
+                "[HEAL] Ignoring legacy backbone_fix for LSS (all LSS are "
+                "frozen). Shared detector trainability is controlled by "
+                "freeze_bev_backbone / freeze_fusion / freeze_heads."
             )
-        # self.dir_head = nn.Conv2d(args['in_head'], args['dir_args']['num_bins'] * args['anchor_number'],
-        #                           kernel_size=1) # BIN_NUM = 2
-        
-        if args["backbone_fix"]:
-            self.backbone_fix(args["backbone_fix"])
-            
-    def backbone_fix(self, args):
-        """
-        Fix the parameters of backbone during finetune on timedelay。
-        """
-        if type(args) == bool:
-        
-            if "vehicle" in self.collaborators:
-                for p in self.veh_models.parameters():
-                    p.requires_grad = False
-            if "rsu" in self.collaborators:
-                for p in self.rsu_models.parameters():
-                    p.requires_grad = False
-            if "drone" in self.collaborators:
-                for p in self.drone_models.parameters():
-                    p.requires_grad = False
-        
-        elif type(args) == list:
-            for i in range(len(args)):
-                if args[i] == "vehicle":
-                    print("fix vehicle")
-                    for p in self.veh_models.parameters():
-                        p.requires_grad = False
-                elif args[i] == "rsu":
-                    print("fix rsu")
-                    for p in self.rsu_models.parameters():
-                        p.requires_grad = False
-                elif args[i] == "drone":
-                    print("fix drone")
-                    for p in self.drone_models.parameters():
-                        p.requires_grad = False
-                else:
-                    raise ValueError("args should be bool or list")
-        
-        else:
-            raise ValueError("args should be bool or list")
 
-        for p in self.backbone.parameters():
-            p.requires_grad = False
+        freeze_modules = {
+            "backbone": freeze_bev,
+            "pyramid_backbone": freeze_fusion,
+            "cls_head": freeze_heads,
+            "reg_head": freeze_heads,
+        }
+        if self.shrink_conv is not None:
+            freeze_modules["shrink_conv"] = freeze_fusion
+        if self.obj_head is not None:
+            freeze_modules["obj_head"] = freeze_heads
+        if self.seg_head is not None:
+            freeze_modules["seg_head"] = freeze_heads
 
-        if self.compression:
-            for p in self.naive_compressor.parameters():
-                p.requires_grad = False
-        if self.shrink_flag:
-            for p in self.shrink_conv.parameters():
-                p.requires_grad = False
-                
-        for p in self.pyramid_backbone.parameters():
-            p.requires_grad = False
+        apply_named_freeze_policy(
+            self,
+            freeze_lss=bool(args.get("freeze_lss", True)),
+            freeze_modules=freeze_modules,
+            assembled_inference=bool(args.get("assembled_inference", False)),
+        )
+        assert_lss_frozen(self)
 
-        if self.args["task"] == "det":
-            for p in self.cls_head.parameters():
-                p.requires_grad = False
-            for p in self.reg_head.parameters():
-                p.requires_grad = False
-            if self.args["obj_head"]:
-                for p in self.obj_head.parameters():
-                    p.requires_grad = False
-
-        elif self.args["task"] == "seg":
-            for p in self.seg_head.parameters():
-                p.requires_grad = False
-                
-                
-
-
-    def forward(self, data_dict):
-        output_dict = {'pyramid': 'single'}
-        
+    def forward(self, data_dict: Dict[str, Any]) -> Dict[str, Any]:
+        """Heterogeneous collab detection in the vehicle domain."""
         batch_output_dict, batch_record_len = self.extract_features(data_dict)
-        comm_rates = batch_output_dict["spatial_features"].count_nonzero().item()
-        batch_output_dict = self.backbone(batch_output_dict)
-        
-        batch_spatial_features_2d = batch_output_dict["spatial_features_2d"]
-        # camera features are still in its own coordinate system
-        pairwise_t_matrix = data_dict["img_pairwise_t_matrix_collab"]
-        
-        fused_feature, occ_outputs = self.pyramid_backbone.forward_collab(
-                                        batch_spatial_features_2d,
-                                        batch_record_len, 
-                                        pairwise_t_matrix[:, :, :, [0, 1], :][
-                                            :, :, :, :, [0, 1, 3]], 
-                                    )
-
-        if self.shrink_flag:
-            fused_feature = self.shrink_conv(fused_feature)
-
-        if self.args["task"] == "det":
-            psm = self.cls_head(fused_feature)
-            rm = self.reg_head(fused_feature)
-
-            if self.args["obj_head"]:
-                obj = self.obj_head(fused_feature)
-                output_dict.update({"obj": obj})
-            output_dict.update(
-                {
-                    "psm": psm,
-                    "rm": rm,
-                    "comm_rate": comm_rates,
-                }
-            )
-
-        elif self.args["task"] == "seg":
-            seg_logits = self.seg_head(fused_feature)
-            output_dict.update(
-                {
-                    "comm_rate": comm_rates,
-                }
-            )
-            output_dict.update(seg_logits)
-       
+        spatial_features = batch_output_dict["spatial_features"]
+        comm_rates = spatial_features.count_nonzero().item()
+        spatial_features_2d = self.detector.encode_bev(spatial_features)
+        fused_feature, _occ = self.detector.fuse_and_decode(
+            spatial_features_2d,
+            batch_record_len,
+            data_dict["img_pairwise_t_matrix_collab"],
+        )
+        output_dict = self.detector.decode_heads(fused_feature)
+        output_dict["comm_rate"] = comm_rates
+        output_dict["pyramid"] = "collab"
         return output_dict
-        
-        
-        
-        
-    

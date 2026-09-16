@@ -1,9 +1,14 @@
-python opencood/tools/train_stamp.py \
-    -y opencood/hypes_yaml/airv2x/lidar/det/airv2x_stamp/airv2x_stamp_collab_lidar.yaml \
-    --vehicle_dir opencood/logs/airv2x_HEAL_vehicle_lidar/default__2025_07_11_11_17_34 \
-    --vehicle_epoch 10 \
-    --rsu_dir opencood/logs/airv2x_HEAL_rsu_lidar/default__2025_07_11_11_14_22 \
-    --rsu_epoch 16 \
-    --drone_dir opencood/logs/airv2x_HEAL_drone_lidar/default__2025_07_11_11_16_23 \
-    --drone_epoch 12 \
+#!/usr/bin/env bash
+# AirV2X STAMP adapter training from the three shared Stage-0 bases.
+set -euo pipefail
 
+VEH_DIR=${VEH_DIR:-opencood/logs/airv2x_homo_vehicle_camera/homo_vehicle}
+RSU_DIR=${RSU_DIR:-opencood/logs/airv2x_homo_rsu_camera/homo_rsu}
+DRONE_DIR=${DRONE_DIR:-opencood/logs/airv2x_homo_drone_camera/homo_drone}
+
+python opencood/tools/train_airv2x_heter.py \
+  -y opencood/hypes_yaml/airv2x/camera/det/airv2x_stamp/airv2x_stamp_collab_camera.yaml \
+  --vehicle_dir "${VEH_DIR}" \
+  --rsu_dir "${RSU_DIR}" \
+  --drone_dir "${DRONE_DIR}" \
+  --tag stamp_collab

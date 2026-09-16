@@ -1,0 +1,29 @@
+# Homogeneous Stage-0 RSU base. Train once, reuse for HEAL / STAMP / NegoCollab.
+inherit_from: opencood/hypes_yaml/airv2x/camera/det/_shared_camera_det.yaml
+yaml_parser: "load_airv2x_heter_params"
+
+name: airv2x_homo_rsu_camera
+collaborators: ["rsu"]
+ego_type: rsu
+
+train_params:
+  max_cav:
+    vehicle: 0
+    rsu: 2
+    drone: 0
+
+preprocess:
+  ego_type: rsu
+
+postprocess:
+  ego_type: rsu
+
+model:
+  core_method: airv2x_homo_base
+  args:
+    collaborators: ["rsu"]
+    homo_agent_type: rsu
+    freeze_lss: true
+    freeze_bev_backbone: false
+    freeze_fusion: false
+    freeze_heads: false
