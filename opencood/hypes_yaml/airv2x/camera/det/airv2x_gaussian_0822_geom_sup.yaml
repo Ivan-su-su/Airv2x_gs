@@ -1,0 +1,17 @@
+name: airv2x_gaussian_0822_geom_sup
+inherit_from: opencood/hypes_yaml/airv2x/camera/det/airv2x_gaussian_0822.yaml
+yaml_parser: "load_airv2x_heter_params"
+
+model:
+  args:
+    stage1_feature_only: true
+    separate_stage12_sampler: true
+
+    geometry_supervision:
+      enabled: true
+      beta: 1.0
+
+loss:
+  det:
+    args:
+      geom_weight: 1.0

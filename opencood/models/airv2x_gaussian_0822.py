@@ -54,6 +54,9 @@ from opencood.models.gaussian_modules_0822.projection.mamba_projection_wrapper i
 from opencood.models.gaussian_modules_0822.refinement.gaussian_refiner import (
     GaussianRefiner,
 )
+from opencood.models.gaussian_modules_0822.refinement.geometry_supervision import (
+    compute_stage2_delta_mean_loss,
+)
 from opencood.models.gaussian_modules_0822.sampling.gaussian_offset_sampler import (
     GaussianOffsetSampler,
 )
@@ -74,6 +77,16 @@ class Airv2xGaussian0822(nn.Module):
         super().__init__()
         self.args = args
         self.vehicle_p1_v45 = bool(args.get("vehicle_p1_v45", False))
+        geom_sup = args.get("geometry_supervision") or {}
+        self.geometry_supervision_enabled = bool(geom_sup.get("enabled", False))
+        self.geometry_supervision_beta = float(geom_sup.get("beta", 1.0))
+        self.depth_ranges: Dict[str, Tuple[float, float]] = {}
+        for agent_type in AGENT_TYPES:
+            cam_cfg = ((args.get(agent_type) or {}).get("cam") or {})
+            ddiscr = (cam_cfg.get("grid_conf") or {}).get("ddiscr")
+            if ddiscr is None or len(ddiscr) < 2:
+                continue
+            self.depth_ranges[agent_type] = (float(ddiscr[0]), float(ddiscr[1]))
         self.frontend = ImageFrontend(args)
         self.highres = nn.ModuleDict()
         self.depth_moments = nn.ModuleDict()
@@ -111,10 +124,20 @@ class Airv2xGaussian0822(nn.Module):
         encoder = GaussianGeometryEncoder(
             geo_dim=int(refinement_cfg["geometry"]["geo_dim"])
         )
-        sampler = GaussianOffsetSampler(
+        stage1_sampler = GaussianOffsetSampler(
             feature_dim=F90_CHANNELS, geometry_encoder=encoder
         )
+        separate_stage12_sampler = bool(
+            args.get("separate_stage12_sampler", False)
+        )
+        if separate_stage12_sampler:
+            stage2_sampler = GaussianOffsetSampler(
+                feature_dim=F90_CHANNELS, geometry_encoder=encoder
+            )
+        else:
+            stage2_sampler = stage1_sampler
         projector = MambaProjectionWrapper()
+        stage1_feature_only = bool(args.get("stage1_feature_only", False))
         stage1_refiner = GaussianRefiner(
             encoder, feature_dim=F90_CHANNELS, cfg=refinement_cfg
         )
@@ -129,17 +152,18 @@ class Airv2xGaussian0822(nn.Module):
         attn_cfg = args.get("gaussian_attention") or {}
         self.intra_view = IntraViewInteraction(
             feature_dim=F90_CHANNELS,
-            sampler=sampler,
+            sampler=stage1_sampler,
             projector=projector,
             refiner=stage1_refiner,
             refinement_cfg=refinement_cfg,
             attn_cfg=attn_cfg,
             points_frame="ego",
+            refine=not stage1_feature_only,
         )
         self.cross_agent = build_cross_agent_interactions(
             feature_dim=F90_CHANNELS,
             refinement_cfg=refinement_cfg,
-            sampler=sampler,
+            sampler=stage2_sampler,
             projector=projector,
             adapter=stage2_adapter,
             refiner=stage2_refiner,
@@ -310,6 +334,7 @@ class Airv2xGaussian0822(nn.Module):
                 gs, payload["f90"], payload[CAMERA_GEOMETRY_KEY], agent=agent
             )
         data_dict["gaussians"] = gaussians
+        stage1_gaussians = dict(gaussians)
 
         sources = {
             agent: {
@@ -318,7 +343,7 @@ class Airv2xGaussian0822(nn.Module):
             }
             for agent in gaussians
         }
-        gaussians = self.cross_agent(gaussians, sources)
+        gaussians = self.cross_agent(stage1_gaussians, sources)
         data_dict["gaussians"] = gaussians
 
         _, bev = self.stage3(gaussians)
@@ -332,4 +357,15 @@ class Airv2xGaussian0822(nn.Module):
         }
         if self.use_quality_head:
             output_dict["quality"] = self.quality_head(fused)
+        if self.geometry_supervision_enabled and self.training:
+            output_dict["geom_loss"] = compute_stage2_delta_mean_loss(
+                stage1_gaussians_by_agent=stage1_gaussians,
+                stage2_gaussians_by_agent=gaussians,
+                data_dict=data_dict,
+                cross_valid_by_agent=getattr(
+                    self.cross_agent, "last_valid_masks", {}
+                ),
+                depth_ranges=self.depth_ranges,
+                beta=self.geometry_supervision_beta,
+            )
         return output_dict

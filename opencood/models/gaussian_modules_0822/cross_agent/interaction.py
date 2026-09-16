@@ -127,6 +127,7 @@ class CrossAgentInteraction(nn.Module):
                 self.geometry_encoder, feature_dim=feature_dim, cfg=cfg
             )
         self.last_stats: Dict[str, Any] = {}
+        self.last_valid_masks: Dict[str, torch.Tensor] = {}
 
     def _sample_tokens(
         self,
@@ -165,9 +166,17 @@ class CrossAgentInteraction(nn.Module):
                 f"but the set is '{gaussians.agent}'"
             )
         if gaussians.n_gaussians == 0:
+            self.last_valid_masks[query_agent] = torch.empty(
+                (0,), dtype=torch.bool, device=gaussians.mean.device
+            )
             return gaussians
         present_sources = tuple(source for source in source_agents if source in sources)
         if not present_sources:
+            self.last_valid_masks[query_agent] = torch.zeros(
+                gaussians.n_gaussians,
+                dtype=torch.bool,
+                device=gaussians.mean.device,
+            )
             return gaussians
 
         points = self.sampler(
@@ -188,6 +197,7 @@ class CrossAgentInteraction(nn.Module):
             mask_groups.append(mask)
         mask = torch.cat(mask_groups, dim=1)
         valid = mask.any(dim=1)
+        self.last_valid_masks[query_agent] = valid
         n_total = int(gaussians.n_gaussians)
         n_valid = int(valid.sum().item())
         self.last_stats[interaction_type] = {
@@ -233,6 +243,7 @@ class CrossAgentInteraction(nn.Module):
         out = dict(gaussians)
         types = (interaction_type,) if interaction_type else INTERACTION_TYPES
         self.last_stats = {}
+        self.last_valid_masks = {}
         for itype in types:
             query_agent, _sources = interaction_sources(itype)
             if query_agent not in out:

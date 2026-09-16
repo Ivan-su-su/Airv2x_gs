@@ -109,6 +109,7 @@ class PointPillarLossMultiClass(nn.Module):
         # Quality head supervision: BCEWithLogits against the BEV IoU
         # between predicted box and matched GT, positives only.
         self.quality_weight = args.get("quality_weight", 0.0)  # 0.0 means disabled
+        self.geom_weight = float(args.get("geom_weight", 0.0))
         self.recall_weight = args.get("recall_weight", 0.0)  # 0.0 means disabled, for encouraging more detections
         self.flow_weight = args["flow_weight"] if "flow_weight" in args else 1.0
         self.loss_dict = {}
@@ -307,6 +308,12 @@ class PointPillarLossMultiClass(nn.Module):
             )
             total_loss = total_loss + quality_loss_weighted
 
+        geom_loss = output_dict.get("geom_loss", None)
+        geom_loss_weighted = 0.0
+        if self.geom_weight > 0.0 and torch.is_tensor(geom_loss):
+            geom_loss_weighted = self.geom_weight * geom_loss
+            total_loss = total_loss + geom_loss_weighted
+
         loss_dict_update = {
                 "total_loss{}".format(prefix): total_loss.item(),
                 "reg_loss{}".format(prefix): reg_loss.item(),
@@ -334,6 +341,11 @@ class PointPillarLossMultiClass(nn.Module):
                 loss_dict_update["quality_loss{}".format(prefix)] = quality_loss_weighted.item()
             else:
                 loss_dict_update["quality_loss{}".format(prefix)] = float(quality_loss_weighted)
+        if self.geom_weight > 0.0:
+            if torch.is_tensor(geom_loss_weighted):
+                loss_dict_update["geom_loss{}".format(prefix)] = geom_loss_weighted.item()
+            else:
+                loss_dict_update["geom_loss{}".format(prefix)] = float(geom_loss_weighted)
         self.loss_dict.update(loss_dict_update)
 
         return total_loss
