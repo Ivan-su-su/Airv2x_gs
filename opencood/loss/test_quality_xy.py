@@ -213,7 +213,7 @@ def test_4_reg_code_weights() -> None:
     assert torch.allclose(uni(a, b), base(a, b), atol=1e-7)
 
 
-def _make_postprocessor():
+def _make_postprocessor(quality_aware_nms: bool = True):
     from opencood.data_utils.post_processor.voxel_postprocessor import (
         VoxelPostprocessor,
     )
@@ -236,6 +236,7 @@ def _make_postprocessor():
         "order": "hwl",
         "nms_thresh": 0.15,
         "ego_type": "vehicle",
+        "quality_aware_nms": quality_aware_nms,
     }
 
     class _P:  # minimal stub, only attribute access used
@@ -330,6 +331,16 @@ def test_8_old_checkpoint_quality_missing() -> None:
     assert torch.allclose(scores_b, scores, atol=1e-6)
 
 
+def test_9_yaml_switch_off_ignores_quality() -> None:
+    """quality_aware_nms=False must ignore quality even if the key exists."""
+    proc_off = _make_postprocessor(quality_aware_nms=False)
+    data_q, out_q, _ = _post_batch(with_quality=True, seed=3)
+    data_no, out_no, _ = _post_batch(with_quality=False, seed=3)
+    _, scores_q, _, _ = proc_off.post_process_airv2x(data_q, out_q)
+    _, scores_no, _, _ = proc_off.post_process_airv2x(data_no, out_no)
+    assert torch.allclose(scores_q, scores_no, atol=1e-6)
+
+
 if __name__ == "__main__":
     test_1_quality_head_shape()
     print("test_1 ok")
@@ -341,4 +352,6 @@ if __name__ == "__main__":
     print("test_5_6_7 ok")
     test_8_old_checkpoint_quality_missing()
     print("test_8 ok")
+    test_9_yaml_switch_off_ignores_quality()
+    print("test_9 ok")
     print("all quality/xy tests ok")

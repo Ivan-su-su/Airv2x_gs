@@ -784,11 +784,9 @@ class VoxelPostprocessor(BasePostprocessor):
             if mask.sum() == 0:
                 continue
 
-            # Quality map for quality-aware NMS: sigmoid(quality logits),
-            # flattened with the exact same order as obj (permute(0,2,3,1)).
-            # Old checkpoints without a quality head simply skip this and
-            # fall back to objectness-only NMS ranking.
-            if "quality" in output_dict[cav_id]:
+            # Quality-aware NMS is off unless yaml sets quality_aware_nms.
+            # Missing quality output also falls back to objectness ranking.
+            if self.params.get("quality_aware_nms", False) and "quality" in output_dict[cav_id]:
                 quality_logits = output_dict[cav_id]["quality"]  # [1, A, H, W]
                 quality_map = torch.sigmoid(
                     quality_logits.permute(0, 2, 3, 1).contiguous()

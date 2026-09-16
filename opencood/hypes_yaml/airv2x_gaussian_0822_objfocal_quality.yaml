@@ -136,6 +136,7 @@ postprocess:
   order: 'hwl'
   max_num: 300
   nms_thresh: 0.15
+  quality_aware_nms: true
 
 
 #########
@@ -263,6 +264,7 @@ model:
     cav_range: *cav_lidar
     seg_res: *seg_res
     obj_head: true
+    use_quality_head: true
     # Fresh-run prior for the obj_head bias (logit = log(p/(1-p))).
     obj_prior_prob: 0.01
 
