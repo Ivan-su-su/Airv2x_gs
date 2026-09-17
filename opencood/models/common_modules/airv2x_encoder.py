@@ -240,7 +240,6 @@ class LiftSplatShootEncoder(nn.Module):
             & (geom_feats[:, 2] >= 0)
             & (geom_feats[:, 2] < self.nx[2])
         )
-        import pdb; pdb.set_trace()
         x = x[kept]
         
         geom_feats = geom_feats[kept]

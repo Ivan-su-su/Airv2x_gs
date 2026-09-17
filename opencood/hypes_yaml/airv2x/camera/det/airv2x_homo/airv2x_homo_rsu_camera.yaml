@@ -6,17 +6,28 @@ name: airv2x_homo_rsu_camera
 collaborators: ["rsu"]
 ego_type: rsu
 
+# Stage-0 strictly RGB-only: no GT depth PNG, no GT-depth fog, imgs C==3.
+rgb_only_no_depth_gt: true
+
 train_params:
   max_cav:
     vehicle: 0
     rsu: 2
     drone: 0
 
+# GT / anchor range for RSU ego (official HEAL rsu camera).
 preprocess:
   ego_type: rsu
+  args:
+    voxel_size: [0.4, 0.4, 40]
+  cav_lidar_range: [-140.8, -40, -30, 140.8, 40, 10]
+
+POINT_CLOUD_RANGE: [-140.8, -40, -30, 140.8, 40, 10]
 
 postprocess:
   ego_type: rsu
+  anchor_args:
+    cav_lidar_range: [-140.8, -40, -30, 140.8, 40, 10]
 
 model:
   core_method: airv2x_homo_base
@@ -27,3 +38,8 @@ model:
     freeze_bev_backbone: false
     freeze_fusion: false
     freeze_heads: false
+    p1_checkpoint: /home/dell/suyi/AirV2X-Perception_gs/opencood/logs/airv2x_gaussian_final/net_final_branch_v45.pth
+    rsu:
+      cam:
+        img_downsample: 4
+        img_features: 128

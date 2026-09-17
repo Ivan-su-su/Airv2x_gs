@@ -232,6 +232,9 @@ class BaseDataset(Dataset):
         # 从模型配置中读取（如果存在）
         backbone_2d_cfg = params.get("model", {}).get("args", {}).get("BACKBONE_2D", {})
         self.load_image_semantic_gt = backbone_2d_cfg.get("LOAD_IMAGE_SEMANTIC_GT", False)
+        # Stage-0 homo opt-in: strictly RGB-only, never touch GT depth PNGs.
+        # Old configs without this field keep the exact legacy behavior.
+        self.rgb_only_no_depth_gt = bool(params.get("rgb_only_no_depth_gt", False))
         self.semantic_map = np.array([
             0,   # background
             1,   # bicycle -> bicycle
@@ -402,9 +405,13 @@ class BaseDataset(Dataset):
             # 保存相机文件路径（用于后续加载语义真值）
             data[cav_id]["camera_paths"] = cav_content[timestamp_key_delay]["cameras"]
             
-            data[cav_id]["depth"] = load_camera_data(
-                cav_content[timestamp_key_delay]["depth"]
-            )
+            # Stage-0 homo RGB-only: skip GT depth PNG decoding entirely.
+            if self.rgb_only_no_depth_gt:
+                data[cav_id]["depth"] = []
+            else:
+                data[cav_id]["depth"] = load_camera_data(
+                    cav_content[timestamp_key_delay]["depth"]
+                )
 
             if getattr(self, "use_lidar", True):
                 data[cav_id]["lidar_np"] = pcd_utils.pcd_to_np(

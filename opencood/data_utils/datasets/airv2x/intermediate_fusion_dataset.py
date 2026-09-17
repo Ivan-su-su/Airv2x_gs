@@ -66,6 +66,13 @@ class IntermediateFusionDatasetAirv2x(basedataset.BaseDataset):
     def __init__(self, params, visualize, train=True):
         super(IntermediateFusionDatasetAirv2x, self).__init__(params, visualize, train)
 
+        # Stage-0 homo RGB-only: no GT depth anywhere in the pipeline.
+        # Old configs default to False and keep legacy behavior untouched.
+        self.rgb_only_no_depth_gt = bool(params.get("rgb_only_no_depth_gt", False))
+        if self.rgb_only_no_depth_gt:
+            print("[dataset] rgb_only_no_depth_gt=True: RGB 3-channel only, "
+                  "no GT depth PNG, no GT-depth fog augmentation")
+
         # if project first, cav's lidar will first be projected to
         # the ego's coordinate frame. otherwise, the feature will be
         # projected instead.
@@ -300,7 +307,8 @@ class IntermediateFusionDatasetAirv2x(basedataset.BaseDataset):
         metadata_path = None
 
         too_far = []
-        apply_fog = self._sample_uses_fog(idx)
+        # Fog augmentation consumes GT depth; forbidden in Stage-0 RGB-only.
+        apply_fog = self._sample_uses_fog(idx) and not self.rgb_only_no_depth_gt
         fog_betas = self._sample_fog_betas() if apply_fog else None
 
         # Collect data for each agent

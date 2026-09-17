@@ -6,6 +6,9 @@ name: airv2x_homo_vehicle_camera
 collaborators: ["vehicle"]
 ego_type: vehicle
 
+# Stage-0 strictly RGB-only: no GT depth PNG, no GT-depth fog, imgs C==3.
+rgb_only_no_depth_gt: true
+
 train_params:
   max_cav:
     vehicle: 3
@@ -21,3 +24,8 @@ model:
     freeze_bev_backbone: false
     freeze_fusion: false
     freeze_heads: false
+    p1_checkpoint: /home/dell/suyi/AirV2X-Perception_gs/opencood/logs/airv2x_gaussian_final/net_final_branch_v45.pth
+    vehicle:
+      cam:
+        img_downsample: 8
+        img_features: 128

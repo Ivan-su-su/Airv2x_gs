@@ -381,3 +381,191 @@ def load_stage0_bases_for_heal_or_stamp(
     print("[ckpt] HEAL/STAMP mapping: encoders from matching bases; "
           "shared backbone/fusion/heads from vehicle base.")
     return reports
+
+
+# ---------------------------------------------------------------------------
+# Homo Stage-0 initialization from the Gaussian P1 branch checkpoint
+# ---------------------------------------------------------------------------
+
+# Source prefix of the official CamEncode image branch inside
+# `net_final_branch.pth` (ImageFrontend.encoders is a ModuleDict keyed by
+# agent type; each entry is a full CamEncode: trunk/up1/up2/depth_head/image_head).
+STAGE0_LSS_SOURCE_PREFIX = "frontend.encoders.{agent}."
+
+
+def _structural_prefix_match(
+    module: nn.Module,
+    state: Mapping[str, torch.Tensor],
+) -> Optional[str]:
+    """Find a source prefix that exactly covers ``module`` (names + shapes).
+
+    Scans every 1-3 level prefix of ``state``. A prefix qualifies only when
+    remapping it onto ``module`` matches 100% of ``module.state_dict()``
+    keys with zero shape mismatches. Never fuzzy-matches partial coverage.
+
+    Args:
+        module: Destination module (e.g. BEV backbone, bevencode).
+        state: Flat checkpoint state_dict.
+
+    Returns:
+        The qualifying source prefix, or None when no prefix qualifies.
+    """
+    dst = module.state_dict()
+    if not dst:
+        return None
+    candidates: set = set()
+    for key in state:
+        parts = key.split(".")
+        for depth in (1, 2, 3):
+            if len(parts) > depth:
+                candidates.add(".".join(parts[:depth]) + ".")
+    for prefix in sorted(candidates):
+        mapped = remap_prefix(filter_by_prefix(state, (prefix,)), prefix, "")
+        matched = sum(
+            1
+            for key, tensor in mapped.items()
+            if key in dst and tuple(dst[key].shape) == tuple(tensor.shape)
+        )
+        if matched == len(dst):
+            return prefix
+    return None
+
+
+def load_homo_stage0_initialization(
+    model: nn.Module,
+    checkpoint_path: str,
+    agent_type: str,
+    map_location: str = "cpu",
+) -> CheckpointLoadReport:
+    """Initialize one homo Stage-0 LSS from the pretrained branch checkpoint.
+
+    Loads ``frontend.encoders.<agent_type>.*`` (official CamEncode:
+    trunk / up1 / up2 / depth_head / image_head) onto the matching
+    ``<agent>_models[0].camencode`` with exact 1:1 coverage — any missing /
+    unexpected / shape-mismatched tensor fails loudly, partial loads are
+    refused. BEV backbone and LSS bevencode availability is probed
+    structurally (prefix-agnostic, 100%-coverage required) and reported.
+
+    Args:
+        model: ``Airv2xHomoBase`` (before DDP wrap, already on device).
+        checkpoint_path: e.g. ``.../airv2x_gaussian_final/net_final_branch.pth``.
+        agent_type: ``vehicle`` / ``rsu`` / ``drone`` — selects the source
+            branch; no cross-agent loading ever happens.
+        map_location: torch.load map_location.
+
+    Returns:
+        CheckpointLoadReport of the CamEncode copy.
+
+    Raises:
+        RuntimeError / ValueError / FileNotFoundError: on any non-exact or
+            ambiguous mapping. Never silently skips.
+    """
+    if agent_type not in AGENT_ENCODER_ATTR:
+        raise ValueError(f"Unknown agent_type: {agent_type}")
+
+    state = load_raw_checkpoint(checkpoint_path, map_location)
+    src_prefix = STAGE0_LSS_SOURCE_PREFIX.format(agent=agent_type)
+    agent_state = filter_by_prefix(state, (src_prefix,))
+
+    print("[stage0-init]")
+    print(f"checkpoint:\n  {os.path.abspath(checkpoint_path)}")
+    print(f"agent:\n  {agent_type}")
+
+    if not agent_state:
+        top_groups = sorted({key.split(".")[0] for key in state})
+        raise RuntimeError(
+            f"[stage0-init] source checkpoint has no keys under '{src_prefix}'. "
+            f"Top-level groups present: {top_groups}. "
+            "Refusing to guess a different source prefix."
+        )
+
+    depth_head_keys = sorted(k for k in agent_state if ".depth_head." in k)
+    attr = AGENT_ENCODER_ATTR[agent_type]
+    print(f"LSS source:\n  {src_prefix}")
+    print(f"LSS destination:\n  {attr}[0].camencode")
+    if not depth_head_keys:
+        raise RuntimeError(
+            f"[stage0-init] '{src_prefix}' contains no predicted-depth head "
+            "(camencode.depth_head.*). This checkpoint cannot initialize an "
+            "RGB predicted-depth LSS for Stage-0 (use_depth_gt=false)."
+        )
+    print(f"depth_head:\n  FOUND ({len(depth_head_keys)} tensors)")
+
+    module_list = getattr(model, attr, None)
+    if not isinstance(module_list, nn.ModuleList) or len(module_list) != 1:
+        raise RuntimeError(
+            f"[stage0-init] destination model must expose exactly one "
+            f"{attr} entry (homo Stage-0 trains a single agent type)."
+        )
+    lss = module_list[0]
+    camencode = getattr(lss, "camencode", None)
+    if not isinstance(camencode, nn.Module):
+        raise RuntimeError(
+            f"[stage0-init] {attr}[0] has no .camencode — unexpected model "
+            "structure for LiftSplatShootEncoder."
+        )
+
+    mapped = remap_prefix(agent_state, src_prefix, "")
+    report = copy_matching_tensors(
+        camencode,
+        mapped,
+        source=f"{checkpoint_path}:{src_prefix}*",
+        destination=f"{attr}[0].camencode",
+        min_match_ratio=1.0,
+    )
+    if report.missing or report.unexpected or report.shape_mismatch:
+        raise RuntimeError(
+            "[stage0-init] LSS load was NOT exact: "
+            f"missing={len(report.missing)} unexpected={len(report.unexpected)} "
+            f"shape_mismatch={len(report.shape_mismatch)}. "
+            "Partial / fuzzy loads are not allowed."
+        )
+    print(f"matched:\n  {report.matched} / {len(camencode.state_dict())}")
+    print("missing:\n  0")
+    print("unexpected:\n  0")
+    print("shape mismatch:\n  0")
+
+    # -- BEV backbone probe: structural, never by name guessing. ----------
+    backbone = getattr(model, "backbone", None)
+    if isinstance(backbone, nn.Module):
+        prefix = _structural_prefix_match(backbone, state)
+        if prefix is None:
+            print(
+                "BEV backbone:\n  NOT AVAILABLE — training Stage-0 backbone "
+                "from random initialization"
+            )
+        else:
+            mapped_bb = remap_prefix(filter_by_prefix(state, (prefix,)), prefix, "")
+            bb_report = copy_matching_tensors(
+                backbone,
+                mapped_bb,
+                source=f"{checkpoint_path}:{prefix}*",
+                destination="backbone",
+                min_match_ratio=1.0,
+            )
+            print(f"BEV backbone source:\n  {prefix}")
+            print(f"matched:\n  {bb_report.matched} / {len(backbone.state_dict())}")
+            print("shape mismatch:\n  0")
+
+    # -- LSS bevencode probe (ResNet18 BEV encoder inside LSS). ------------
+    bevencode = getattr(lss, "bevencode", None)
+    if isinstance(bevencode, nn.Module):
+        prefix = _structural_prefix_match(bevencode, state)
+        if prefix is None:
+            print(
+                "LSS bevencode:\n  NOT AVAILABLE in source checkpoint — stays "
+                "at random init (frozen together with LSS per freeze_lss "
+                "protocol)"
+            )
+        else:
+            mapped_bv = remap_prefix(filter_by_prefix(state, (prefix,)), prefix, "")
+            copy_matching_tensors(
+                bevencode,
+                mapped_bv,
+                source=f"{checkpoint_path}:{prefix}*",
+                destination=f"{attr}[0].bevencode",
+                min_match_ratio=1.0,
+            )
+            print(f"LSS bevencode source:\n  {prefix}")
+
+    return report

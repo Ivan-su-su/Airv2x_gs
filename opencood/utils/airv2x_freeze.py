@@ -20,7 +20,12 @@ LSS_NAME_TOKENS: Tuple[str, ...] = (
     "rsu_models",
     "drone_models",
     "encoder",
+    "p1_core",
 )
+
+
+def _unwrap(model: nn.Module) -> nn.Module:
+    return model.module if hasattr(model, "module") else model
 
 
 def iter_named_modules(
@@ -45,17 +50,38 @@ def set_module_trainable(module: nn.Module, trainable: bool) -> None:
 
 
 def iter_lss_modules(model: nn.Module) -> Iterable[Tuple[str, nn.Module]]:
-    """Yield LSS / agent-encoder modules attached to an AirV2X model."""
+    """Yield LSS / agent-encoder modules attached to an AirV2X model.
+
+    When a frozen P1 stack is present, only ``p1_core`` is treated as LSS.
+    ``P1SplatEncoder.bevencode`` stays trainable.
+    """
+    core = _unwrap(model)
+    p1_core = getattr(core, "p1_core", None)
+    if p1_core is not None:
+        yield "p1_core", p1_core
+        return
     for agent_type, attr in AGENT_ENCODER_ATTR.items():
-        module = getattr(model, attr, None)
+        module = getattr(core, attr, None)
         if module is not None:
             yield f"{attr}", module
-    local_branches = getattr(model, "local_branches", None)
+    local_branches = getattr(core, "local_branches", None)
     if isinstance(local_branches, nn.ModuleDict):
         for agent_type, branch in local_branches.items():
             encoder = getattr(branch, "encoder", None)
             if encoder is not None:
                 yield f"local_branches.{agent_type}.encoder", encoder
+
+
+def iter_lss_named_parameters(model: nn.Module) -> Iterable[Tuple[str, nn.Parameter]]:
+    """Yield ``(name, param)`` for every frozen-LSS parameter on ``model``."""
+    lss_ids = {
+        id(param)
+        for _, module in iter_lss_modules(model)
+        for param in module.parameters()
+    }
+    for name, param in model.named_parameters():
+        if id(param) in lss_ids:
+            yield name, param
 
 
 def freeze_lss_encoders(model: nn.Module) -> List[str]:
@@ -70,7 +96,11 @@ def freeze_lss_encoders(model: nn.Module) -> List[str]:
 def is_lss_param_name(name: str) -> bool:
     """Return True if a parameter name belongs to an LSS encoder."""
     clean = name[7:] if name.startswith("module.") else name
+    if clean.startswith("p1_core") or ".p1_core." in f".{clean}":
+        return True
     for token in LSS_NAME_TOKENS:
+        if token == "p1_core":
+            continue
         if clean.startswith(token) or f".{token}." in f".{clean}":
             if token == "encoder" and "local_prompt" in clean:
                 return False
@@ -83,8 +113,8 @@ def is_lss_param_name(name: str) -> bool:
 def assert_lss_frozen(model: nn.Module) -> None:
     """Fail if any LSS parameter is trainable."""
     trainable: List[str] = []
-    for name, param in model.named_parameters():
-        if is_lss_param_name(name) and param.requires_grad:
+    for name, param in iter_lss_named_parameters(model):
+        if param.requires_grad:
             trainable.append(name)
     if trainable:
         preview = "\n  ".join(trainable[:20])
@@ -96,11 +126,7 @@ def assert_lss_frozen(model: nn.Module) -> None:
 
 def assert_lss_not_in_optimizer(model: nn.Module, optimizer: torch.optim.Optimizer) -> None:
     """Fail if the optimizer contains any LSS parameter."""
-    lss_ids = {
-        id(param)
-        for name, param in model.named_parameters()
-        if is_lss_param_name(name)
-    }
+    lss_ids = {id(param) for _, param in iter_lss_named_parameters(model)}
     leaked: List[str] = []
     opt_ids = {id(p) for group in optimizer.param_groups for p in group["params"]}
     for name, param in model.named_parameters():
@@ -117,9 +143,7 @@ def assert_lss_not_in_optimizer(model: nn.Module, optimizer: torch.optim.Optimiz
 def assert_no_lss_grad(model: nn.Module) -> None:
     """Fail if any LSS parameter has a non-zero gradient."""
     bad: List[str] = []
-    for name, param in model.named_parameters():
-        if not is_lss_param_name(name):
-            continue
+    for name, param in iter_lss_named_parameters(model):
         if param.grad is None:
             continue
         if torch.isfinite(param.grad).any() and param.grad.abs().sum().item() != 0:
@@ -135,9 +159,8 @@ def assert_no_lss_grad(model: nn.Module) -> None:
 def lss_parameter_checksum(model: nn.Module) -> float:
     """Scalar checksum of all LSS weights (for post-step identity checks)."""
     total = 0.0
-    for name, param in model.named_parameters():
-        if is_lss_param_name(name):
-            total += float(param.detach().float().abs().sum().cpu())
+    for _, param in iter_lss_named_parameters(model):
+        total += float(param.detach().float().abs().sum().cpu())
     return total
 
 

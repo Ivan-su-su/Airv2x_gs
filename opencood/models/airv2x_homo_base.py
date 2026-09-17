@@ -7,10 +7,15 @@ from typing import Any, Dict, List
 
 from opencood.models.airv2x_detector_parts import Airv2xSharedDetector
 from opencood.models.common_modules.airv2x_base_model import Airv2xBase
-from opencood.utils.airv2x_freeze import apply_named_freeze_policy, assert_lss_frozen
+from opencood.models.lss_pretrain_modules.p1_mixin import P1CamMixin
+from opencood.utils.airv2x_freeze import (
+    apply_named_freeze_policy,
+    assert_lss_frozen,
+    iter_lss_modules,
+)
 
 
-class Airv2xHomoBase(Airv2xBase):
+class Airv2xHomoBase(P1CamMixin, Airv2xBase):
     """Homogeneous collaborative detector for exactly one agent type.
 
     Graph::
@@ -44,7 +49,10 @@ class Airv2xHomoBase(Airv2xBase):
                 f"['{self.homo_agent_type}'], got {self.collaborators}"
             )
 
-        self.init_encoders(args)
+        if args.get("p1_checkpoint"):
+            P1CamMixin.init_encoders(self, args)
+        else:
+            Airv2xBase.init_encoders(self, args)
         self.detector = Airv2xSharedDetector(args)
         # Expose the same attribute names as HEAL so Stage-0 checkpoints can
         # be remapped by prefix (`backbone.*`, `pyramid_backbone.*`, ...).
@@ -77,6 +85,23 @@ class Airv2xHomoBase(Airv2xBase):
             assembled_inference=bool(args.get("assembled_inference", False)),
         )
         assert_lss_frozen(self)
+
+    def train(self, mode: bool = True) -> "Airv2xHomoBase":
+        """Keep the frozen LSS in eval mode (BN running stats never update).
+
+        ``super().train(mode)`` would flip every BN inside the frozen LSS
+        back to train mode; this override restores LSS eval so frozen BN
+        running stats stay exactly as loaded from the pretrained checkpoint.
+        The detector (backbone / pyramid / shrink / heads) follows ``mode``.
+        """
+        super().train(mode)
+        if mode and self.args.get("freeze_lss", True):
+            for _, lss_module in iter_lss_modules(self):
+                lss_module.eval()
+            p1_core = getattr(self, "p1_core", None)
+            if p1_core is not None:
+                p1_core.eval()
+        return self
 
     def forward(self, data_dict: Dict[str, Any]) -> Dict[str, Any]:
         """Run homogeneous collaborative detection."""

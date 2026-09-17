@@ -36,6 +36,13 @@ sys.path.append(str(root_path))
 import opencood.hypes_yaml.yaml_utils as yaml_utils
 from opencood.data_utils.datasets import build_dataset
 from opencood.tools import multi_gpu_utils, train_utils
+from opencood.utils.airv2x_freeze import assert_lss_frozen, iter_lss_modules
+
+
+def _iter_lss_modules_for_train(model: torch.nn.Module):
+    """Yield LSS modules regardless of DDP wrapping (name, module)."""
+    core = model.module if hasattr(model, "module") else model
+    yield from iter_lss_modules(core)
 
 def train_parser():
     """
@@ -49,6 +56,12 @@ def train_parser():
                       help="Path to training configuration yaml file")
     parser.add_argument("--model_dir", default="",
                       help="Path to continue training from a checkpoint")
+    parser.add_argument("--pretrained_stage0_init", default="",
+                      help="Model-INITIALISATION-only P1 checkpoint for homo "
+                           "Stage-0 (e.g. net_final_branch_v45.pth). Injects "
+                           "model.args.p1_checkpoint so FrozenP1 loads the "
+                           "CamEncode→F90→depth_heads stack before freeze "
+                           "and optimizer creation; never resumes training.")
     parser.add_argument("--dist_url", default="env://",
                       help="URL used to set up distributed training")
     parser.add_argument("--fusion_method", "-f", default="intermediate",
@@ -330,6 +343,14 @@ def main():
     hypes["tag"] = opt.tag
     main_process = is_main_process(opt)
     print("load from yaml file: ", opt.hypes_yaml)
+    if opt.pretrained_stage0_init:
+        if "homo_agent_type" not in hypes.get("model", {}).get("args", {}):
+            raise ValueError(
+                "--pretrained_stage0_init is only valid for homo Stage-0 "
+                "configs (model.args.homo_agent_type missing)."
+            )
+        hypes["model"]["args"]["p1_checkpoint"] = opt.pretrained_stage0_init
+        print(f"[stage0-init] p1_checkpoint = {opt.pretrained_stage0_init}")
     # Build datasets
     print("Building datasets...")
     # 对于MambaFusion模型，需要启用visualize模式以包含origin_lidar等字段
@@ -369,6 +390,18 @@ def main():
             device = torch.device("cpu")
 
     model.to(device)
+
+    # Homo Stage-0 P1: FrozenP1 already loaded exact weights in model __init__.
+    # Verify freeze BEFORE DDP wrap and optimizer creation.
+    stage0_p1 = bool(hypes.get("model", {}).get("args", {}).get("p1_checkpoint"))
+    if stage0_p1:
+        from opencood.utils.airv2x_freeze import assert_lss_not_in_optimizer
+
+        assert_lss_frozen(model)
+        for _, lss_module in _iter_lss_modules_for_train(model):
+            lss_module.eval()
+        print("[stage0-init] frozen P1 verified before optimizer creation.")
+
     if opt.distributed:
         model = torch.nn.parallel.DistributedDataParallel(
             model,
@@ -376,12 +409,23 @@ def main():
             output_device=opt.gpu,
             find_unused_parameters=True
         )
-       
 
-    
+
     # Setup training components
     criterion = train_utils.create_loss(hypes)
     optimizer = train_utils.setup_optimizer(hypes, model)
+
+    # Homo Stage-0: verify frozen P1 never entered the optimizer.
+    if stage0_p1:
+        from opencood.utils.airv2x_freeze import (
+            print_trainable_parameter_groups,
+        )
+
+        assert_lss_not_in_optimizer(model, optimizer)
+        print("[stage0-trainability]")
+        print_trainable_parameter_groups(
+            model, title="Stage-0 post-optimizer trainable groups"
+        )
     
     # Initialize mixed precision training if enabled
     scaler = amp.GradScaler() if opt.amp and torch.cuda.is_available() else None

@@ -6,17 +6,29 @@ name: airv2x_homo_drone_camera
 collaborators: ["drone"]
 ego_type: drone
 
+# Stage-0 strictly RGB-only: no GT depth PNG, no GT-depth fog, imgs C==3.
+rgb_only_no_depth_gt: true
+
 train_params:
   max_cav:
     vehicle: 0
     rsu: 0
     drone: 2
 
+# GT / anchor range must match drone ego height (official HEAL drone camera).
+# Shared default [-3, 1] is vehicle-height and filters out almost all boxes → loss≈0.
 preprocess:
   ego_type: drone
+  args:
+    voxel_size: [0.4, 0.4, 144]
+  cav_lidar_range: [-140.8, -40, -150, 140.8, 40, -6]
+
+POINT_CLOUD_RANGE: [-140.8, -40, -150, 140.8, 40, -6]
 
 postprocess:
   ego_type: drone
+  anchor_args:
+    cav_lidar_range: [-140.8, -40, -150, 140.8, 40, -6]
 
 model:
   core_method: airv2x_homo_base
@@ -27,3 +39,9 @@ model:
     freeze_bev_backbone: false
     freeze_fusion: false
     freeze_heads: false
+    p1_checkpoint: /home/dell/suyi/AirV2X-Perception_gs/opencood/logs/airv2x_gaussian_final/net_final_branch_v45.pth
+    drone:
+      cam:
+        img_downsample: 4
+        img_features: 128
+        lift: delta

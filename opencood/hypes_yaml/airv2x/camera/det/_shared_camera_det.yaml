@@ -23,8 +23,9 @@ train_params:
 device: &device cuda
 train: &train True
 
-root_dir: 'dataset/airv2x/train'
-validate_dir: 'dataset/airv2x/val'
+root_dir: '/home/dell/suyi/AirV2X-Perception/train/train'
+# Stage-0 / early det: evaluate on the same train split (not val).
+validate_dir: '/home/dell/suyi/AirV2X-Perception/train/train'
 test_dir: 'dataset/airv2x/test'
 num_class: &num_class 7
 num_anchor: &num_anchor 2
@@ -41,10 +42,12 @@ fusion:
   args:
     proj_first: &proj_first true
     veh_grid_conf: &veh_grid_conf
+      # Must match the pretrained branch checkpoint exactly:
+      # frontend.encoders.vehicle.depth_head.weight = (50, 256, 1, 1) → D=50.
       xbound: [-140.8, 140.8, 0.4]
       ybound: [-40, 40, 0.4]
       zbound: [-10, 10, 20.0]
-      ddiscr: [2, 50, 48]
+      ddiscr: [0, 50, 50]
       mode: 'LID'
     veh_data_aug_conf: &veh_data_aug_conf_image
       resize_lim: [0.65, 0.7]
@@ -101,6 +104,9 @@ preprocess:
     max_voxel_test: 70000
   cav_lidar_range: &cav_lidar [-140.8, -40, -3, 140.8, 40, 1]
 
+# required by IntermediateFusionDatasetAirv2x (mambafusion fields)
+POINT_CLOUD_RANGE: *cav_lidar
+
 postprocess:
   core_method: 'VoxelPostprocessor'
   ego_type: *ego_type
@@ -156,7 +162,7 @@ model:
         img_features: 64
         bevout_feature: 64
         camera_encoder: EfficientNet
-        use_depth_gt: true
+        use_depth_gt: false
         depth_supervision: false
     rsu:
       modalities: ["cam"]
@@ -179,7 +185,7 @@ model:
         img_features: 64
         bevout_feature: 64
         camera_encoder: EfficientNet
-        use_depth_gt: true
+        use_depth_gt: false
         depth_supervision: false
     drone:
       modalities: ["cam"]
@@ -202,7 +208,7 @@ model:
         img_features: 64
         bevout_feature: 64
         camera_encoder: EfficientNet
-        use_depth_gt: true
+        use_depth_gt: false
         depth_supervision: false
     modality_fusion:
       base_bev_backbone:
