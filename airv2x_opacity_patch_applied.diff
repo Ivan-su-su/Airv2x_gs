@@ -1,0 +1,297 @@
+diff --git a/opencood/models/gaussian_modules_0822/base/gaussian.py b/opencood/models/gaussian_modules_0822/base/gaussian.py
+index 5dfb06f..17130fc 100644
+--- a/opencood/models/gaussian_modules_0822/base/gaussian.py
++++ b/opencood/models/gaussian_modules_0822/base/gaussian.py
+@@ -34,6 +34,7 @@ class GaussianSet:
+         quaternion: ``[N, 4]`` unit rotation ``[w, x, y, z]``.
+         feature: ``[N, C]`` image features.
+         p_fg: Optional ``[N]`` heatmap foreground probability.
++        opacity: Optional ``[N]`` learned evidence strength used by Stage-3.
+         uv: Optional ``[N, 2]`` image-plane pixel coordinates ``(u, v)``.
+         view_index: Optional ``[N]`` flattened camera index.
+         batch_index: Optional ``[N]`` sample / agent-batch index.
+@@ -55,6 +56,7 @@ class GaussianSet:
+     sigma_z: Optional[torch.Tensor] = None
+     agent: str = ""
+     frame: str = "agent"
++    opacity: Optional[torch.Tensor] = None
+ 
+     @property
+     def n_gaussians(self) -> int:
+@@ -80,6 +82,9 @@ class GaussianSet:
+         """
+         return replace(self, feature=feature)
+ 
++    def replace_opacity(self, opacity: Optional[torch.Tensor]) -> "GaussianSet":
++        return replace(self, opacity=opacity)
++
+     def to(self, device: torch.device, dtype: Optional[torch.dtype] = None) -> "GaussianSet":
+         """Move tensors to ``device`` / ``dtype`` (non-index tensors only)."""
+ 
+@@ -103,6 +108,7 @@ class GaussianSet:
+             sigma_z=_cast(self.sigma_z, False),
+             agent=self.agent,
+             frame=self.frame,
++            opacity=_cast(self.opacity, False),
+         )
+ 
+     def index_select(self, index: torch.Tensor) -> "GaussianSet":
+@@ -146,6 +152,7 @@ class GaussianSet:
+             sigma_z=_gather(self.sigma_z),
+             agent=self.agent,
+             frame=self.frame,
++            opacity=_gather(self.opacity),
+         )
+ 
+     def scatter_replace(self, index: torch.Tensor, src: "GaussianSet") -> "GaussianSet":
+diff --git a/opencood/models/gaussian_modules_0822/fusion/gaussian_bev_splat.py b/opencood/models/gaussian_modules_0822/fusion/gaussian_bev_splat.py
+index 0ce4e0e..21b85b3 100644
+--- a/opencood/models/gaussian_modules_0822/fusion/gaussian_bev_splat.py
++++ b/opencood/models/gaussian_modules_0822/fusion/gaussian_bev_splat.py
+@@ -129,6 +129,10 @@ class GaussianBEVSplat(nn.Module):
+         ix = ix[support]
+         iy = iy[support]
+         weight = torch.exp(-0.5 * d2[support])
++        if gaussians.opacity is not None:
++            weight = weight * gaussians.opacity[g_idx].to(
++                device=device, dtype=weight.dtype
++            )
+         n_valid = int(g_idx.shape[0])
+ 
+         # Preserve the absolute Gaussian spatial response.
+diff --git a/opencood/models/gaussian_modules_0822/fusion/gaussian_voxel_pool.py b/opencood/models/gaussian_modules_0822/fusion/gaussian_voxel_pool.py
+index eec0b34..6777bc3 100644
+--- a/opencood/models/gaussian_modules_0822/fusion/gaussian_voxel_pool.py
++++ b/opencood/models/gaussian_modules_0822/fusion/gaussian_voxel_pool.py
+@@ -20,6 +20,9 @@ from opencood.models.gaussian_modules_0822.base.gaussian import GaussianSet
+ from opencood.models.gaussian_modules_0822.base.gaussian_transform import (
+     normalize_quaternion,
+ )
++from opencood.models.gaussian_modules_0822.base.gaussian_init import (
++    covariance_to_scale_quaternion,
++)
+ 
+ DEFAULT_VOXEL_SIZE = (0.4, 0.4, 0.125)
+ # Union of agent zbounds (veh [-10,10], rsu [-30,30], drone [-150,-6]);
+@@ -44,6 +47,24 @@ def scatter_mean(values: torch.Tensor, inverse: torch.Tensor, n_groups: int) ->
+     return sums / counts.unsqueeze(-1)
+ 
+ 
++def scatter_weighted_mean(
++    values: torch.Tensor,
++    weights: torch.Tensor,
++    inverse: torch.Tensor,
++    n_groups: int,
++) -> torch.Tensor:
++    if weights.dim() != 1 or int(weights.shape[0]) != int(values.shape[0]):
++        raise ValueError(
++            f"weights must be [N], got {tuple(weights.shape)} for values {tuple(values.shape)}"
++        )
++    w = weights.to(device=values.device, dtype=values.dtype)
++    sums = values.new_zeros((n_groups, values.shape[1]))
++    sums.index_add_(0, inverse, values * w.unsqueeze(-1))
++    denom = values.new_zeros((n_groups,))
++    denom.index_add_(0, inverse, w)
++    return sums / denom.clamp_min(1.0e-8).unsqueeze(-1)
++
++
+ class GaussianVoxelPool:
+     """MeanVFE-style pooling of one agent's Gaussians.
+ 
+@@ -62,7 +83,12 @@ class GaussianVoxelPool:
+         pc_max = torch.tensor([float(v) for v in point_cloud_range[3:]])
+         self.grid = torch.floor((pc_max - self.pc_min) / self.voxel_size).long()
+ 
+-    def __call__(self, gaussians: GaussianSet) -> GaussianSet:
++    def __call__(
++        self,
++        gaussians: GaussianSet,
++        weights: torch.Tensor | None = None,
++        covariance_pool: bool = False,
++    ) -> GaussianSet:
+         """Pool Gaussians into one token per occupied voxel.
+ 
+         Args:
+@@ -76,6 +102,10 @@ class GaussianVoxelPool:
+         n = gaussians.n_gaussians
+         if n == 0:
+             return gaussians
++        if weights is not None and (weights.dim() != 1 or int(weights.shape[0]) != n):
++            raise ValueError(
++                f"weights must be [N={n}], got {tuple(weights.shape)}"
++            )
+         device, dtype = gaussians.mean.device, gaussians.mean.dtype
+         voxel_size = self.voxel_size.to(device=device, dtype=dtype)
+         pc_min = self.pc_min.to(device=device, dtype=dtype)
+@@ -87,6 +117,7 @@ class GaussianVoxelPool:
+         kept = gaussians.index_select(valid)
+         if kept.n_gaussians == 0:
+             return kept
++        kept_weights = None if weights is None else weights[valid]
+         idx = idx[valid]
+         batch = (
+             kept.batch_index
+@@ -100,25 +131,38 @@ class GaussianVoxelPool:
+         m = int(unq_code.numel())
+         pooled_batch = unq_code // (gx * gy * gz)
+ 
+-        # Quaternion pooling: flip q/-q against each group's first member,
+-        # then average and renormalize. Group starts come from one stable
+-        # sort — no Python loop.
+-        q = kept.quaternion
+-        order = torch.argsort(inverse, stable=True)
+-        sorted_inv = inverse[order]
+-        boundary = torch.ones_like(sorted_inv, dtype=torch.bool)
+-        boundary[1:] = sorted_inv[1:] != sorted_inv[:-1]
+-        first_rows = order[boundary]  # first row of each group, id order
+-        reference = q[first_rows][inverse]
+-        sign = torch.where((q * reference).sum(-1, keepdim=True) < 0.0, -1.0, 1.0)
+-        pooled_quat = normalize_quaternion(scatter_mean(q * sign, inverse, m))
++        def _pool(values: torch.Tensor) -> torch.Tensor:
++            if kept_weights is None:
++                return scatter_mean(values, inverse, m)
++            return scatter_weighted_mean(values, kept_weights, inverse, m)
++
++        if covariance_pool:
++            pooled_cov = _pool(
++                kept.covariance().reshape(kept.n_gaussians, 9)
++            ).reshape(m, 3, 3)
++            pooled_scale, pooled_quat = covariance_to_scale_quaternion(pooled_cov)
++        else:
++            q = kept.quaternion
++            order = torch.argsort(inverse, stable=True)
++            sorted_inv = inverse[order]
++            boundary = torch.ones_like(sorted_inv, dtype=torch.bool)
++            boundary[1:] = sorted_inv[1:] != sorted_inv[:-1]
++            first_rows = order[boundary]
++            reference = q[first_rows][inverse]
++            sign = torch.where(
++                (q * reference).sum(-1, keepdim=True) < 0.0,
++                -1.0,
++                1.0,
++            )
++            pooled_quat = normalize_quaternion(_pool(q * sign))
++            pooled_scale = _pool(kept.scale)
+ 
+         pooled = GaussianSet(
+-            mean=scatter_mean(kept.mean, inverse, m),
+-            scale=scatter_mean(kept.scale, inverse, m),
++            mean=_pool(kept.mean),
++            scale=pooled_scale,
+             quaternion=pooled_quat,
+-            feature=scatter_mean(kept.feature, inverse, m),
+-            p_fg=scatter_mean(kept.p_fg.unsqueeze(-1), inverse, m).squeeze(-1)
++            feature=_pool(kept.feature),
++            p_fg=_pool(kept.p_fg.unsqueeze(-1)).squeeze(-1)
+             if kept.p_fg is not None
+             else None,
+             batch_index=pooled_batch,
+diff --git a/opencood/models/gaussian_modules_0822/interaction/gaussian_context.py b/opencood/models/gaussian_modules_0822/interaction/gaussian_context.py
+index 9d89640..a77a330 100644
+--- a/opencood/models/gaussian_modules_0822/interaction/gaussian_context.py
++++ b/opencood/models/gaussian_modules_0822/interaction/gaussian_context.py
+@@ -25,6 +25,9 @@ from opencood.models.gaussian_modules_0822.cross_agent.adapter import (
+ from opencood.models.gaussian_modules_0822.fusion.gaussian_bev_splat import (
+     GaussianBEVSplat,
+ )
++from opencood.models.gaussian_modules_0822.fusion.gaussian_opacity import (
++    GaussianOpacityCalibrator,
++)
+ from opencood.models.gaussian_modules_0822.fusion.gaussian_voxel_pool import (
+     DEFAULT_POINT_CLOUD_RANGE,
+     DEFAULT_VOXEL_SIZE,
+@@ -66,6 +69,7 @@ class GaussianContextInteraction(nn.Module):
+         adapter: Optional[AgentResidualAdapter] = None,
+         splat: Optional[GaussianBEVSplat] = None,
+         attn_cfg: Optional[Mapping[str, Any]] = None,
++        opacity_cfg: Optional[Mapping[str, Any]] = None,
+     ) -> None:
+         super().__init__()
+         attn = dict(attn_cfg or {})
+@@ -81,6 +85,21 @@ class GaussianContextInteraction(nn.Module):
+         self.pool = GaussianVoxelPool(
+             voxel_size=voxel_size, point_cloud_range=point_cloud_range
+         )
++        opacity = dict(opacity_cfg or {})
++        self.opacity_enabled = bool(opacity.get("enabled", False))
++        self.opacity_agent_specific = bool(opacity.get("agent_specific", True))
++        self.opacity_heads = nn.ModuleDict()
++        if self.opacity_enabled:
++            agents = [str(a) for a in opacity.get("agents", ("vehicle", "rsu", "drone"))]
++            keys = agents if self.opacity_agent_specific else ["shared"]
++            cell_area = float(voxel_size[0]) * float(voxel_size[1])
++            for key in keys:
++                self.opacity_heads[key] = GaussianOpacityCalibrator(
++                    hidden_dim=int(opacity.get("hidden_dim", 8)),
++                    init_prob=float(opacity.get("init_prob", 0.95)),
++                    detach_covariance=bool(opacity.get("detach_covariance", True)),
++                    cell_area=cell_area,
++                )
+         self.split_mlp = nn.Linear(feature_dim, 2 * feature_dim)
+         self.self_blocks = nn.ModuleList(
+             [GaussianInteractionBlock(feature_dim, heads, ffn_dim) for _ in range(n_self)]
+@@ -103,15 +122,36 @@ class GaussianContextInteraction(nn.Module):
+             n_sigma=n_sigma,
+         )
+ 
++    def _calibrate_opacity(
++        self, agent: str, gaussians: GaussianSet
++    ) -> torch.Tensor:
++        key = agent if self.opacity_agent_specific else "shared"
++        if key not in self.opacity_heads:
++            raise KeyError(
++                f"opacity head for {agent!r} is missing; available={list(self.opacity_heads.keys())}"
++            )
++        return self.opacity_heads[key](gaussians)
++
+     def forward(
+         self,
+         gaussians_by_agent: Mapping[str, GaussianSet],
+     ) -> Tuple[GaussianSet, torch.Tensor]:
+-        pooled: Dict[str, GaussianSet] = {
+-            agent: self.pool(gs)
+-            for agent, gs in gaussians_by_agent.items()
+-            if gs.n_gaussians > 0
+-        }
++        pooled: Dict[str, GaussianSet] = {}
++        for agent, gs in gaussians_by_agent.items():
++            if gs.n_gaussians <= 0:
++                continue
++            if self.opacity_enabled:
++                alpha_pre = self._calibrate_opacity(agent, gs)
++                pooled_gs = self.pool(
++                    gs,
++                    weights=alpha_pre,
++                    covariance_pool=True,
++                )
++                alpha_final = self._calibrate_opacity(agent, pooled_gs)
++                pooled_gs = pooled_gs.replace_opacity(alpha_final)
++            else:
++                pooled_gs = self.pool(gs)
++            pooled[agent] = pooled_gs
+         sample = next(iter(gaussians_by_agent.values()))
+         if not pooled:
+             empty = GaussianSet.empty(
+@@ -174,6 +214,16 @@ class GaussianContextInteraction(nn.Module):
+             scale=torch.cat([gs.scale for gs in sets]),
+             quaternion=torch.cat([gs.quaternion for gs in sets]),
+             feature=torch.cat([gs.feature for gs in sets]),
++            p_fg=(
++                torch.cat([gs.p_fg for gs in sets])
++                if all(gs.p_fg is not None for gs in sets)
++                else None
++            ),
++            opacity=(
++                torch.cat([gs.opacity for gs in sets])
++                if all(gs.opacity is not None for gs in sets)
++                else None
++            ),
+             batch_index=torch.cat(
+                 [
+                     gs.batch_index
+@@ -216,4 +266,5 @@ def build_gaussian_context_interaction(
+         n_sigma=float(cfg.get("bev_n_sigma", 3.0)),
+         adapter=adapter,
+         attn_cfg=attn,
++        opacity_cfg=cfg.get("opacity"),
+     )

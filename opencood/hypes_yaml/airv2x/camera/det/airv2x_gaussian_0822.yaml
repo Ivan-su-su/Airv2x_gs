@@ -21,9 +21,9 @@ train_params:
   eval_freq: 2
   save_freq: 1
   max_cav: &max_cav
-    vehicle: 5
-    rsu: 5
-    drone: 5
+    vehicle: 3
+    rsu: 2
+    drone: 2
 
 device: &device cuda
 train: &train True

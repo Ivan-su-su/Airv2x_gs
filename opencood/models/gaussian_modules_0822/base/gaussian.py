@@ -34,6 +34,7 @@ class GaussianSet:
         quaternion: ``[N, 4]`` unit rotation ``[w, x, y, z]``.
         feature: ``[N, C]`` image features.
         p_fg: Optional ``[N]`` heatmap foreground probability.
+        opacity: Optional ``[N]`` learned evidence strength used by Stage-3.
         uv: Optional ``[N, 2]`` image-plane pixel coordinates ``(u, v)``.
         view_index: Optional ``[N]`` flattened camera index.
         batch_index: Optional ``[N]`` sample / agent-batch index.
@@ -55,6 +56,7 @@ class GaussianSet:
     sigma_z: Optional[torch.Tensor] = None
     agent: str = ""
     frame: str = "agent"
+    opacity: Optional[torch.Tensor] = None
 
     @property
     def n_gaussians(self) -> int:
@@ -80,6 +82,9 @@ class GaussianSet:
         """
         return replace(self, feature=feature)
 
+    def replace_opacity(self, opacity: Optional[torch.Tensor]) -> "GaussianSet":
+        return replace(self, opacity=opacity)
+
     def to(self, device: torch.device, dtype: Optional[torch.dtype] = None) -> "GaussianSet":
         """Move tensors to ``device`` / ``dtype`` (non-index tensors only)."""
 
@@ -103,6 +108,7 @@ class GaussianSet:
             sigma_z=_cast(self.sigma_z, False),
             agent=self.agent,
             frame=self.frame,
+            opacity=_cast(self.opacity, False),
         )
 
     def index_select(self, index: torch.Tensor) -> "GaussianSet":
@@ -146,6 +152,7 @@ class GaussianSet:
             sigma_z=_gather(self.sigma_z),
             agent=self.agent,
             frame=self.frame,
+            opacity=_gather(self.opacity),
         )
 
     def scatter_replace(self, index: torch.Tensor, src: "GaussianSet") -> "GaussianSet":

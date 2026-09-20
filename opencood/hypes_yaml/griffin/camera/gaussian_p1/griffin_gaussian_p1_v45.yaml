@@ -1,0 +1,94 @@
+name: griffin_gaussian_p1_v45
+
+# Raw Griffin input. We deliberately bypass griffin-nuscenes because instance
+# segmentation and vehicle lidar depth supervision live in griffin-release.
+dataset:
+  root: /mnt/home/suyi/Griffin/datasets/griffin_50scenes_55m/griffin-release
+  split_json: /mnt/home/suyi/Griffin/data/split_datas/griffin_50scenes_55m.json
+  final_dim: [360, 640]
+  vehicle_stride: 8
+  drone_stride: 4
+
+  # MUST be checked once with check_griffin_p1_data.py before training.
+  lidar_num_features: 4
+
+  # Raw Griffin instance PNGs come from CARLA instance segmentation:
+  # OpenCV BGRA channel 2 == CARLA semantic-tag R; G/B encode instance ID.
+  # Match Griffin's own detection categories:
+  # 12 pedestrian, 14 car, 15 truck, 16 bus, 18 motorcycle, 19 bicycle.
+  mask_foreground_mode: carla_semantic
+  target_semantic_tags: [12, 14, 15, 16, 18, 19]
+  max_mask_foreground_ratio: 0.98
+
+  # Mirrors Griffin's official training recipe at the appearance level:
+  # PhotoMetricDistortionMultiViewImage. Geometry stays deterministic because
+  # P1 depth supervision needs exact K/extrinsic alignment.
+  photometric_distortion: true
+  seed: 20260918
+
+model:
+  heatmap_num_classes: 2
+
+  # Vehicle keeps the AirV2X V45 depth discretization.
+  vehicle:
+    cam:
+      grid_conf:
+        xbound: [-140.8, 140.8, 0.4]
+        ybound: [-40, 40, 0.4]
+        zbound: [-10, 10, 20.0]
+        ddiscr: [0, 50, 50]
+        mode: LID
+      data_aug_conf:
+        final_dim: [360, 640]
+      img_downsample: 8
+      img_features: 64
+      use_depth_gt: false
+      depth_supervision: true
+
+  # Drone uses the same independent EfficientNet/HighRes branch, but only the
+  # heatmap head is instantiated/optimized. Depth downstream = ideal geometry.
+  drone:
+    cam:
+      grid_conf:
+        xbound: [-140.8, 140.8, 0.4]
+        ybound: [-40, 40, 0.4]
+        zbound: [-150, -6, 144]
+        ddiscr: [6, 150, 144]
+        mode: UD
+      data_aug_conf:
+        final_dim: [360, 640]
+      img_downsample: 8
+      img_features: 64
+      use_depth_gt: false
+      depth_supervision: false
+
+loss:
+  heatmap_gamma: 2.0
+  vehicle_heatmap_weight: 1.0
+  drone_heatmap_weight: 1.0
+  vehicle_depth_weight: 1.0
+
+# Reuse the existing GaussianP1DepthLoss for the vehicle categorical depth.
+depth_loss:
+  alpha: 0.25
+  gamma: 2.0
+  smooth_target: false
+  # Directly constrains the soft expected camera-z in addition to class focal.
+  metric_lambda: 0.3
+
+optimizer:
+  # Fine-tuning, not from-scratch training.
+  trunk_lr: 2.0e-5
+  feature_lr: 1.0e-4
+  head_lr: 2.0e-4
+  weight_decay: 1.0e-4
+
+train:
+  pretrained: /mnt/home/suyi/AirV2X-Perception_gaussian/opencood/logs/airv2x_gaussian_final/net_final_branch_v45.pth
+  output_dir: /mnt/home/suyi/AirV2X-Perception_gaussian/opencood/logs/griffin_gaussian_p1_v45
+  epochs: 15
+  batch_size: 2
+  workers: 8
+  amp: true
+  grad_clip: 10.0
+  save_every: 5

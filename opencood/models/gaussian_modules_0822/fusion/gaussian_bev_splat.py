@@ -129,6 +129,10 @@ class GaussianBEVSplat(nn.Module):
         ix = ix[support]
         iy = iy[support]
         weight = torch.exp(-0.5 * d2[support])
+        if gaussians.opacity is not None:
+            weight = weight * gaussians.opacity[g_idx].to(
+                device=device, dtype=weight.dtype
+            )
         n_valid = int(g_idx.shape[0])
 
         # Preserve the absolute Gaussian spatial response.
