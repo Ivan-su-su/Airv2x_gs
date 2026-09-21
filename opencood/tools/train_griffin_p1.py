@@ -1,9 +1,12 @@
 # -*- coding: utf-8 -*-
-"""Fine-tune AirV2X Gaussian-0822 P1 on Griffin 55m raw data.
+"""Train Gaussian-0822 P1 on Griffin 55m raw data.
 
 Trainable paths:
 * Vehicle: independent EfficientNet-B0/CamEncode + V45 HighResFusion + heatmap + depth.
 * Drone: independent EfficientNet-B0/CamEncode + V90 HighResFusion + bottom heatmap.
+
+CamEncode keeps its built-in ImageNet EfficientNet-B0 initialization.
+No AirV2X P1 checkpoint is loaded.
 
 Drone depth is deliberately NOT trained. Downstream Griffin inference should
 use analytic bottom-camera ideal ground projection.
@@ -12,7 +15,6 @@ use analytic bottom-camera ideal ground projection.
 from __future__ import annotations
 
 import argparse
-import json
 import os
 import sys
 from pathlib import Path
@@ -188,18 +190,15 @@ def assert_branch_parameter_isolation(model: torch.nn.Module) -> None:
 
 
 def setup_optimizer(model: torch.nn.Module, cfg: Dict[str, Any]) -> torch.optim.Optimizer:
-    """AdamW with explicit Vehicle/Drone x trunk/feature/head groups.
-
-    Splitting groups does not change the loss graph; it makes agent ownership
-    and future branch-specific LR changes explicit.
-    """
+    """AirV2X-style Adam: EfficientNet non-BN trunk at 0.1x base LR."""
     opt = cfg["optimizer"]
     lrs = {
-        "trunk": float(opt.get("trunk_lr", 2e-5)),
-        "feature": float(opt.get("feature_lr", 1e-4)),
-        "head": float(opt.get("head_lr", 2e-4)),
+        "trunk": float(opt.get("trunk_lr", 2e-4)),
+        "feature": float(opt.get("feature_lr", 2e-3)),
+        "head": float(opt.get("head_lr", 2e-3)),
     }
     wd = float(opt.get("weight_decay", 1e-4))
+    eps = float(opt.get("eps", 1e-10))
 
     grouped: Dict[Tuple[str, str], list] = {
         (agent, family): []
@@ -243,7 +242,7 @@ def setup_optimizer(model: torch.nn.Module, cfg: Dict[str, Any]) -> torch.optim.
                 f"{len(params)} tensors lr={lrs[family]:g}"
             )
 
-    return torch.optim.AdamW(param_groups, weight_decay=wd)
+    return torch.optim.Adam(param_groups, weight_decay=wd, eps=eps)
 
 
 def assert_branch_gradient_isolation(
@@ -354,6 +353,7 @@ def batch_loss_metrics(
             {"vehicle": depth_valid},
             camera_z_gts={"vehicle": z_gt},
         )
+        v_depth_loss = v_depth_loss + 0.0 * pred["vehicle"]["depth_logits"].sum()
         vehicle_total = w_v_hm * v_hm_loss + w_v_depth * v_depth_loss
         drone_total = w_d_hm * d_hm_loss
         total = vehicle_total + drone_total
@@ -431,7 +431,6 @@ def save_ckpt(
     scheduler: torch.optim.lr_scheduler._LRScheduler,
     scaler: amp.GradScaler,
     cfg: Dict[str, Any],
-    init_report: Dict[str, Any],
     val_metrics: Dict[str, float],
 ) -> None:
     torch.save(
@@ -442,7 +441,6 @@ def save_ckpt(
             "scheduler_state_dict": scheduler.state_dict(),
             "scaler_state_dict": scaler.state_dict(),
             "config": cfg,
-            "airv2x_init_report": init_report,
             "val_metrics": val_metrics,
         },
         str(path),
@@ -516,16 +514,21 @@ def main() -> None:
         persistent_workers=workers > 0,
     )
 
-    # Build and initialize each rank from the same AirV2X V45 P1 checkpoint.
+    # CamEncode internally loads ImageNet EfficientNet-B0. Griffin P1 modules
+    # start fresh; do not load AirV2X task-specific P1 weights.
     core = GriffinGaussianP1(cfg["model"]).to(device)
-    init_report = core.load_airv2x_v45(cfg["train"]["pretrained"], device)
+    if main_process:
+        print("[init] ImageNet EfficientNet-B0 only; no AirV2X P1 checkpoint")
     core.assert_train_eval_state(True)
     assert_branch_parameter_isolation(core)
 
     optimizer = setup_optimizer(core, cfg)
-    epochs = int(cfg["train"].get("epochs", 15))
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=max(epochs, 1)
+    epochs = int(cfg["train"].get("epochs", 50))
+    sched_cfg = cfg.get("lr_scheduler", {})
+    scheduler = torch.optim.lr_scheduler.MultiStepLR(
+        optimizer,
+        milestones=[int(x) for x in sched_cfg.get("milestones", [10, 25, 40])],
+        gamma=float(sched_cfg.get("gamma", 0.1)),
     )
     use_amp = bool(args.amp or cfg["train"].get("amp", True)) and device.type == "cuda"
     scaler = amp.GradScaler(enabled=use_amp)
@@ -537,9 +540,6 @@ def main() -> None:
         writer = SummaryWriter(str(output_dir))
         (output_dir / "resolved_config.yaml").write_text(
             yaml.safe_dump(cfg, sort_keys=False)
-        )
-        (output_dir / "airv2x_init_report.json").write_text(
-            json.dumps(init_report, indent=2)
         )
     else:
         writer = None
@@ -677,7 +677,6 @@ def main() -> None:
                 scheduler,
                 scaler,
                 cfg,
-                init_report,
                 val_metrics,
             )
             if val_metrics.get("loss_total", float("inf")) < best_val:
@@ -690,7 +689,6 @@ def main() -> None:
                     scheduler,
                     scaler,
                     cfg,
-                    init_report,
                     val_metrics,
                 )
             save_every = int(cfg["train"].get("save_every", 5))
@@ -703,7 +701,6 @@ def main() -> None:
                     scheduler,
                     scaler,
                     cfg,
-                    init_report,
                     val_metrics,
                 )
 

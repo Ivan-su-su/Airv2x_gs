@@ -423,12 +423,17 @@ def project_lidar_to_camera_cells(
     original_hw: Tuple[int, int],
     final_hw: Tuple[int, int],
     stride: int,
+    foreground_mask: np.ndarray,
 ) -> Tuple[np.ndarray, np.ndarray]:
-    """Project vehicle LiDAR to camera and keep nearest optical-z per P1 cell."""
+    """Project object LiDAR points to camera and keep nearest optical-z per P1 cell."""
     orig_h, orig_w = int(original_hw[0]), int(original_hw[1])
     final_h, final_w = int(final_hw[0]), int(final_hw[1])
     stride = int(stride)
     out_h, out_w = final_h // stride, final_w // stride
+    if foreground_mask.shape != (orig_h, orig_w):
+        raise ValueError(
+            f"foreground_mask={foreground_mask.shape} vs image={(orig_h, orig_w)}"
+        )
 
     xyz_h = np.concatenate(
         [xyz_lidar, np.ones((xyz_lidar.shape[0], 1), dtype=np.float64)], axis=1
@@ -448,9 +453,17 @@ def project_lidar_to_camera_cells(
     u = uvw[:, 0] / z
     v = uvw[:, 1] / z
     in_img = (u >= 0.0) & (u < orig_w) & (v >= 0.0) & (v < orig_h)
-    u = u[in_img] * (float(final_w) / float(orig_w))
-    v = v[in_img] * (float(final_h) / float(orig_h))
+    u = u[in_img]
+    v = v[in_img]
     z = z[in_img]
+
+    # Only points projected onto Griffin object pixels supervise depth.
+    ui = np.floor(u).astype(np.int64)
+    vi = np.floor(v).astype(np.int64)
+    on_object = foreground_mask[vi, ui]
+    u = u[on_object] * (float(final_w) / float(orig_w))
+    v = v[on_object] * (float(final_h) / float(orig_h))
+    z = z[on_object]
 
     j = np.floor(u / stride).astype(np.int64)
     i = np.floor(v / stride).astype(np.int64)
@@ -552,7 +565,7 @@ class GriffinP1Dataset(Dataset):
         frame: str,
         stride: int,
         rng: np.random.RandomState,
-    ) -> Tuple[torch.Tensor, torch.Tensor, Tuple[int, int], float]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, Tuple[int, int], np.ndarray, float]:
         rgb_path = side_root / "camera" / cam / f"{frame}.png"
         mask_path = side_root / "camera" / f"instance_{cam}" / f"{frame}.png"
 
@@ -586,7 +599,7 @@ class GriffinP1Dataset(Dataset):
             fg.astype(np.uint8), (final_w, final_h), interpolation=cv2.INTER_NEAREST
         ).astype(bool)
         target = _block_any(fg_rs, stride).astype(np.int64)
-        return img_t, torch.from_numpy(target).long(), original_hw, fg_ratio_raw
+        return img_t, torch.from_numpy(target).long(), original_hw, fg, fg_ratio_raw
 
     def __getitem__(self, index: int) -> Dict[str, Any]:
         frame = self.frames[index]
@@ -602,7 +615,7 @@ class GriffinP1Dataset(Dataset):
         vehicle_mask_ratio: List[float] = []
 
         for view_idx, cam in enumerate(VEHICLE_CAMS):
-            img_t, hm_t, original_hw, fg_ratio = self._load_view(
+            img_t, hm_t, original_hw, fg_mask, fg_ratio = self._load_view(
                 self.vehicle_root,
                 cam,
                 frame,
@@ -618,6 +631,7 @@ class GriffinP1Dataset(Dataset):
                 original_hw,
                 self.final_hw,
                 self.vehicle_stride,
+                fg_mask,
             )
             vehicle_imgs.append(img_t)
             vehicle_hm.append(hm_t)
@@ -629,7 +643,7 @@ class GriffinP1Dataset(Dataset):
         drone_hm: List[torch.Tensor] = []
         drone_mask_ratio: List[float] = []
         for view_idx, cam in enumerate(DRONE_CAMS):
-            img_t, hm_t, _original_hw, fg_ratio = self._load_view(
+            img_t, hm_t, _original_hw, _fg_mask, fg_ratio = self._load_view(
                 self.drone_root,
                 cam,
                 frame,

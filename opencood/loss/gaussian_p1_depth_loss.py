@@ -154,9 +154,21 @@ class GaussianP1DepthLoss(nn.Module):
                         and "depth_z_mean" in pred
                     ):
                         z_gt = camera_z_gts[agent_type]
+                        # IMPORTANT: Griffin sparse camera-z targets contain NaN
+                        # outside LiDAR-populated cells.  Computing SmoothL1 on
+                        # the full tensor and masking afterwards gives a finite
+                        # forward scalar, but the backward of the masked-out NaN
+                        # entries is still NaN (0 * NaN -> NaN).  Under AMP the
+                        # GradScaler then silently skips every optimizer.step().
+                        #
+                        # Slice FIRST so invalid NaNs never enter the loss graph.
+                        pred_valid = pred["depth_z_mean"][valid]
+                        z_gt_valid = z_gt[valid]
                         aux = F.smooth_l1_loss(
-                            pred["depth_z_mean"], z_gt, reduction="none"
-                        )[valid].mean()
+                            pred_valid,
+                            z_gt_valid,
+                            reduction="mean",
+                        )
                         agent_loss = agent_loss + self.metric_lambda * aux
             if agent_loss is None:
                 continue
