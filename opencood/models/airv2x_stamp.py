@@ -10,6 +10,7 @@ from torch import Tensor
 from opencood.models.airv2x_detector_parts import Airv2xSharedDetector
 from opencood.models.common_modules.airv2x_base_model import Airv2xBase
 from opencood.models.fuse_modules.adapter import Adapter
+from opencood.models.lss_pretrain_modules.p1_mixin import P1CamMixin
 from opencood.utils.airv2x_agent_repack import infer_batch_size, repack_agent_features
 from opencood.utils.airv2x_freeze import (
     apply_named_freeze_policy,
@@ -18,7 +19,7 @@ from opencood.utils.airv2x_freeze import (
 )
 
 
-class Airv2xSTAMP(Airv2xBase):
+class Airv2xSTAMP(P1CamMixin, Airv2xBase):
     """AirV2X STAMP baseline (not the full original STAMP protocol).
 
     Graph::
@@ -38,6 +39,8 @@ class Airv2xSTAMP(Airv2xBase):
         self.args = args
         self.collaborators = args["collaborators"]
         self.active_sensors = args["active_sensors"]
+        if not args.get("p1_checkpoint"):
+            raise ValueError("STAMP requires --p1_checkpoint for the P1 homo bases")
         self.init_encoders(args)
 
         self.detector = Airv2xSharedDetector(args)
@@ -77,6 +80,8 @@ class Airv2xSTAMP(Airv2xBase):
             assembled_inference=bool(args.get("assembled_inference", False)),
             allow_zero_trainable=True,
         )
+        for attr in ("veh_models", "rsu_models", "drone_models"):
+            set_module_trainable(getattr(self, attr), False)
         for adapter in self.adapters.values():
             set_module_trainable(adapter, True)
             adapter.train()
@@ -88,6 +93,18 @@ class Airv2xSTAMP(Airv2xBase):
                 "cannot be the only adapters during adapter training."
             )
         print(f"[STAMP] trainable adapter parameters: {n_adapter:,}")
+
+    def train(self, mode: bool = True) -> "Airv2xSTAMP":
+        super().train(mode)
+        for attr in (
+            "veh_models", "rsu_models", "drone_models", "backbone",
+            "pyramid_backbone", "shrink_conv", "cls_head", "reg_head",
+            "obj_head", "seg_head",
+        ):
+            module = getattr(self, attr, None)
+            if module is not None:
+                module.eval()
+        return self
 
     def _encode_type(self, data_dict: Dict[str, Any], agent_type: str) -> Optional[Tensor]:
         """LSS → shared backbone → adapter for one agent type."""

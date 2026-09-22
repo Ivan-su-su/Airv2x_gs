@@ -6,10 +6,13 @@ from typing import Any, Dict
 
 from opencood.models.airv2x_detector_parts import Airv2xSharedDetector
 from opencood.models.common_modules.airv2x_base_model import Airv2xBase
-from opencood.utils.airv2x_freeze import apply_named_freeze_policy, assert_lss_frozen
+from opencood.models.lss_pretrain_modules.p1_mixin import P1CamMixin
+from opencood.utils.airv2x_freeze import (
+    apply_named_freeze_policy, assert_lss_frozen, set_module_trainable,
+)
 
 
-class Airv2xHEAL(Airv2xBase):
+class Airv2xHEAL(P1CamMixin, Airv2xBase):
     """AirV2X adaptation of HEAL.
 
     Graph::
@@ -35,6 +38,8 @@ class Airv2xHEAL(Airv2xBase):
         self.args = args
         self.collaborators = args["collaborators"]
         self.active_sensors = args["active_sensors"]
+        if not args.get("p1_checkpoint"):
+            raise ValueError("HEAL requires --p1_checkpoint for the P1 homo bases")
         self.init_encoders(args)
 
         self.detector = Airv2xSharedDetector(args)
@@ -83,7 +88,15 @@ class Airv2xHEAL(Airv2xBase):
             freeze_modules=freeze_modules,
             assembled_inference=bool(args.get("assembled_inference", False)),
         )
+        for attr in ("veh_models", "rsu_models", "drone_models"):
+            set_module_trainable(getattr(self, attr), False)
         assert_lss_frozen(self)
+
+    def train(self, mode: bool = True) -> "Airv2xHEAL":
+        super().train(mode)
+        for attr in ("veh_models", "rsu_models", "drone_models"):
+            getattr(self, attr).eval()
+        return self
 
     def forward(self, data_dict: Dict[str, Any]) -> Dict[str, Any]:
         """Heterogeneous collab detection in the vehicle domain."""

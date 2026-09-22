@@ -119,7 +119,7 @@ def resolve_checkpoint_path(
     if not os.path.isdir(model_dir_or_file):
         raise FileNotFoundError(model_dir_or_file)
 
-    if start_from_best:
+    if start_from_best and epoch is None:
         best = glob.glob(os.path.join(model_dir_or_file, "net_epoch_bestval_at*.pth"))
         if len(best) == 1:
             return best[0]
@@ -210,6 +210,11 @@ def copy_matching_tensors(
             f"Shape mismatch while loading {source} → {destination}: "
             + "; ".join(report.shape_mismatch[:8])
         )
+    if min_match_ratio == 1.0 and report.unexpected:
+        raise RuntimeError(
+            f"Unexpected pretrained tensors while loading {source} → {destination}: "
+            + "; ".join(report.unexpected[:8])
+        )
     if report.matched < min_match:
         raise RuntimeError(
             f"Suspiciously few parameters matched while loading {source} → "
@@ -243,14 +248,40 @@ def load_agent_encoder(
     module = getattr(model, attr, None)
     if module is None:
         raise AttributeError(f"{type(model).__name__} has no encoder attr '{attr}'")
-    prefix = f"{attr}."
+    if len(module) != 1 or not hasattr(module[0], "bevencode"):
+        raise RuntimeError(f"{attr} must contain exactly one P1SplatEncoder")
+    prefix = f"{attr}.0.bevencode."
     mapped = remap_prefix(filter_by_prefix(ckpt_state, (prefix,)), prefix, "")
     return copy_matching_tensors(
-        module,
+        module[0].bevencode,
         mapped,
         source=f"{source}:{prefix}*",
-        destination=f"{type(model).__name__}.{attr}",
+        destination=f"{type(model).__name__}.{attr}[0].bevencode",
+        min_match_ratio=1.0,
     )
+
+
+def verify_frozen_p1(model: nn.Module, ckpt_state: Mapping[str, torch.Tensor],
+                     agent_type: str, *, source: str) -> None:
+    """Fail if the Stage-0 frozen P1 differs from the Stage-2 P1 frontend."""
+    prefix = "p1_core."
+    source_keys = filter_by_prefix(ckpt_state, (prefix,))
+    if not source_keys:
+        raise RuntimeError(f"{source} has no p1_core tensors; expected P1 homo checkpoint")
+    dst = model.p1_core.state_dict()
+    wrong = []
+    for key, value in source_keys.items():
+        suffix = key[len(prefix):]
+        if suffix not in dst or dst[suffix].shape != value.shape or not torch.equal(
+            dst[suffix].cpu(), value.cpu()
+        ):
+            wrong.append(key)
+    if wrong:
+        raise RuntimeError(
+            f"P1 frontend differs for {agent_type} in {source}: {wrong[:8]}. "
+            "Use the same net_final_branch checkpoint that initialized Stage-0."
+        )
+    print(f"[ckpt] verified {len(source_keys)} frozen P1 tensors for {agent_type}")
 
 
 def load_shared_detector(
@@ -276,6 +307,7 @@ def load_shared_detector(
                 mapped,
                 source=f"{source}:{prefix}*",
                 destination=f"{type(model).__name__}.{attr}",
+                min_match_ratio=1.0,
             )
         )
     if not reports:
@@ -301,19 +333,22 @@ def load_local_branch(
     """
     reports: List[CheckpointLoadReport] = []
     encoder_attr = AGENT_ENCODER_ATTR[agent_type]
-    encoder_prefix = f"{encoder_attr}.0."
+    encoder_prefix = f"{encoder_attr}.0.bevencode."
     encoder = getattr(branch, "encoder", None)
     if encoder is None:
         raise AttributeError("local branch has no `.encoder`")
+    if not hasattr(encoder, "bevencode"):
+        raise RuntimeError("NegoCollab local branch must use P1SplatEncoder")
     mapped_encoder = remap_prefix(
         filter_by_prefix(ckpt_state, (encoder_prefix,)), encoder_prefix, ""
     )
     reports.append(
         copy_matching_tensors(
-            encoder,
+            encoder.bevencode,
             mapped_encoder,
             source=f"{source}:{encoder_prefix}*",
-            destination=f"local_branches.{agent_type}.encoder",
+            destination=f"local_branches.{agent_type}.encoder.bevencode",
+            min_match_ratio=1.0,
         )
     )
 
@@ -336,6 +371,7 @@ def load_local_branch(
                 mapped,
                 source=f"{source}:{src_prefix}*",
                 destination=f"local_branches.{agent_type}.{attr}",
+                min_match_ratio=1.0,
             )
         )
     return reports
@@ -363,6 +399,12 @@ def load_stage0_bases_for_heal_or_stamp(
     vehicle_state = load_raw_checkpoint(vehicle_path, map_location)
     rsu_state = load_raw_checkpoint(rsu_path, map_location)
     drone_state = load_raw_checkpoint(drone_path, map_location)
+    for agent_type, state, path in (
+        ("vehicle", vehicle_state, vehicle_path),
+        ("rsu", rsu_state, rsu_path),
+        ("drone", drone_state, drone_path),
+    ):
+        verify_frozen_p1(model, state, agent_type, source=path)
 
     reports: Dict[str, List[CheckpointLoadReport]] = {
         "vehicle_encoder": [

@@ -9,6 +9,7 @@ active_sensors: &active_sensors ["cam"]
 collaborators: &collaborators ["vehicle", "rsu", "drone"]
 ego_type: &ego_type vehicle
 bevcam_fov: 110
+rgb_only_no_depth_gt: true
 
 train_params:
   batch_size: &batch_size 2

@@ -2,13 +2,18 @@
 # AirV2X STAMP adapter training from the three shared Stage-0 bases.
 set -euo pipefail
 
-VEH_DIR=${VEH_DIR:-opencood/logs/airv2x_homo_vehicle_camera/homo_vehicle}
-RSU_DIR=${RSU_DIR:-opencood/logs/airv2x_homo_rsu_camera/homo_rsu}
-DRONE_DIR=${DRONE_DIR:-opencood/logs/airv2x_homo_drone_camera/homo_drone}
+: "${VEH_CKPT:?Set VEH_CKPT to a homo vehicle .pth}"
+: "${RSU_CKPT:?Set RSU_CKPT to a homo RSU .pth}"
+: "${DRONE_CKPT:?Set DRONE_CKPT to a homo drone .pth}"
+: "${P1_CKPT:?Set P1_CKPT to the original net_final_branch_v45.pth}"
+: "${TRAIN_DATA:?Set TRAIN_DATA to the AirV2X training split}"
+: "${VAL_DATA:?Set VAL_DATA to an independent AirV2X validation split}"
 
 python opencood/tools/train_airv2x_heter.py \
   -y opencood/hypes_yaml/airv2x/camera/det/airv2x_stamp/airv2x_stamp_collab_camera.yaml \
-  --vehicle_dir "${VEH_DIR}" \
-  --rsu_dir "${RSU_DIR}" \
-  --drone_dir "${DRONE_DIR}" \
+  --vehicle_dir "${VEH_CKPT}" \
+  --rsu_dir "${RSU_CKPT}" \
+  --drone_dir "${DRONE_CKPT}" \
+  --p1_checkpoint "${P1_CKPT}" \
+  --root_dir "${TRAIN_DATA}" --validate_dir "${VAL_DATA}" \
   --tag stamp_collab

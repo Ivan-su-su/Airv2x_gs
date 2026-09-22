@@ -32,19 +32,21 @@ class P1CamMixin:
                     raise NotImplementedError(
                         f"P1 cam frontend does not wrap modality={modality}"
                     )
-                cam_args = dict(args[agent]["cam"])
-                cam_args["img_features"] = int(F90_CHANNELS)
-                if agent == "vehicle":
-                    cam_args["img_downsample"] = (
-                        8 if self.p1_core.r2_downsample is not None else 4
-                    )
-                else:
-                    cam_args["img_downsample"] = 4
-                if agent == "drone":
-                    cam_args["lift"] = str(cam_args.get("lift") or "delta")
-                print(
-                    f"[stage0-p1] {agent} splat frustum downsample="
-                    f"{cam_args['img_downsample']} img_features="
-                    f"{cam_args['img_features']} lift={cam_args.get('lift', 'categorical')}"
-                )
-                bucket.append(P1SplatEncoder(cam_args, agent, encode))
+                bucket.append(make_p1_splat_encoder(args, agent, encode, self.p1_core))
+
+
+def make_p1_splat_encoder(args, agent, encode, p1_core):
+    """Build the same P1 splat module for homo and heterogeneous models."""
+    cam_args = dict(args[agent]["cam"])
+    cam_args["img_features"] = int(F90_CHANNELS)
+    cam_args["img_downsample"] = (
+        8 if agent == "vehicle" and p1_core.r2_downsample is not None else 4
+    )
+    if agent == "drone":
+        cam_args["lift"] = str(cam_args.get("lift") or "delta")
+    print(
+        f"[stage0-p1] {agent} splat frustum downsample="
+        f"{cam_args['img_downsample']} img_features="
+        f"{cam_args['img_features']} lift={cam_args.get('lift', 'categorical')}"
+    )
+    return P1SplatEncoder(cam_args, agent, encode)

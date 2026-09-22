@@ -10,7 +10,8 @@ from torch import Tensor, nn
 
 from opencood.models.airv2x_detector_parts import Airv2xSharedDetector
 from opencood.models.common_modules.airv2x_base_model import Airv2xBase
-from opencood.models.common_modules.airv2x_encoder import LiftSplatShootEncoder
+from opencood.models.lss_pretrain_modules.frozen_p1 import FrozenP1
+from opencood.models.lss_pretrain_modules.p1_mixin import make_p1_splat_encoder
 from opencood.models.negocollab_modules.comm_in_pub import ComminPub
 from opencood.models.negocollab_modules.negotiator import Negotiator
 from opencood.models.negocollab_modules.resize_net import ResizeNet
@@ -34,11 +35,10 @@ from opencood.utils.negocollab_transform import to_normalized_affine
 class LocalPerceptionBranch(nn.Module):
     """One homogeneous Stage-0 stack: LSS → backbone → aligner → fusion → heads."""
 
-    def __init__(self, args: Dict[str, Any], agent_type: str) -> None:
+    def __init__(self, args: Dict[str, Any], agent_type: str, p1_core: FrozenP1) -> None:
         super().__init__()
         self.agent_type = agent_type
-        cam_args = args[agent_type]["cam"]
-        self.encoder = LiftSplatShootEncoder(cam_args, agent_type=agent_type)
+        self.encoder = make_p1_splat_encoder(args, agent_type, p1_core.encode, p1_core)
         self.detector = Airv2xSharedDetector(args)
         self.backbone = self.detector.backbone
         self.pyramid_backbone = self.detector.pyramid_backbone
@@ -82,12 +82,17 @@ class Airv2xNegoCollab(Airv2xBase):
             raise KeyError("NegoCollab requires args['cav_range']")
         self.collaborators = list(args["collaborators"])
         self.active_sensors = args["active_sensors"]
+        if not args.get("p1_checkpoint"):
+            raise ValueError("NegoCollab requires --p1_checkpoint for the P1 homo bases")
+        self.p1_core = FrozenP1(args)
 
         self.local_branches = nn.ModuleDict()
         self.comms = nn.ModuleDict()
         self.nego_resizers = nn.ModuleDict()
         for agent_type in self.collaborators:
-            self.local_branches[agent_type] = LocalPerceptionBranch(args, agent_type)
+            self.local_branches[agent_type] = LocalPerceptionBranch(
+                args, agent_type, self.p1_core
+            )
             comm_args = dict(args[agent_type]["comm_args"])
             comm_args.setdefault("local_range", list(self.cav_range))
             comm_args["modality"] = agent_type
@@ -145,6 +150,22 @@ class Airv2xNegoCollab(Airv2xBase):
             raise RuntimeError(
                 f"NegoCollab stage={self.stage} has zero trainable parameters"
             )
+
+    def train(self, mode: bool = True) -> "Airv2xNegoCollab":
+        super().train(mode)
+        # The local detector and P1 frontend remain frozen in both stages.
+        self.p1_core.eval()
+        self.local_branches.eval()
+        if self.stage == "ft":
+            self.negotiator.eval()
+            self.occ_head_nego.eval()
+            self.nego_resizers.eval()
+            for comm in self.comms.values():
+                for name in ("local2unify", "sender_recombiner", "sender_aligner"):
+                    module = getattr(comm, name, None)
+                    if module is not None:
+                        module.eval()
+        return self
 
     def _encode_local_by_type(self, data_dict: Dict[str, Any]) -> Dict[str, Tensor]:
         local_by_type: Dict[str, Tensor] = {}
