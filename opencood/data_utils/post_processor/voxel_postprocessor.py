@@ -34,13 +34,28 @@ class VoxelPostprocessor(BasePostprocessor):
         W = self.params["anchor_args"]["W"]
         H = self.params["anchor_args"]["H"]
 
-        l = self.params["anchor_args"]["l"]
-        w = self.params["anchor_args"]["w"]
-        h = self.params["anchor_args"]["h"]
-        r = self.params["anchor_args"]["r"]
+        anchor_args = self.params["anchor_args"]
+        r = [math.radians(ele) for ele in anchor_args["r"]]
+        sizes = anchor_args.get("sizes")
 
-        assert self.anchor_num == len(r)
-        r = [math.radians(ele) for ele in r]
+        if sizes is None:
+            sizes = [[
+                float(anchor_args["h"]),
+                float(anchor_args["w"]),
+                float(anchor_args["l"]),
+                float(anchor_args.get("z", -1.0)),
+            ]]
+        sizes = [tuple(float(v) for v in size) for size in sizes]
+        if any(len(size) != 4 for size in sizes):
+            raise ValueError(
+                "anchor_args.sizes entries must be [h, w, l, z]"
+            )
+        expected_anchor_num = len(sizes) * len(r)
+        if self.anchor_num != expected_anchor_num:
+            raise ValueError(
+                f"anchor num={self.anchor_num}, but sizes({len(sizes)}) x "
+                f"rotations({len(r)}) = {expected_anchor_num}"
+            )
 
         vh = self.params["anchor_args"]["vh"]  # voxel_size
         vw = self.params["anchor_args"]["vw"]
@@ -62,21 +77,31 @@ class VoxelPostprocessor(BasePostprocessor):
         x = np.linspace(xrange[0] + vw, xrange[1] - vw, W // feature_stride)
         y = np.linspace(yrange[0] + vh, yrange[1] - vh, H // feature_stride)
 
-        cx, cy = np.meshgrid(x, y)
-        cx = np.tile(cx[..., np.newaxis], self.anchor_num)  # center
-        cy = np.tile(cy[..., np.newaxis], self.anchor_num)
-        cz = np.ones_like(cx) * -1.0
+        cx_base, cy_base = np.meshgrid(x, y)
+        h_list = []
+        w_list = []
+        l_list = []
+        z_list = []
+        r_list = []
+        for h_val, w_val, l_val, z_val in sizes:
+            for r_val in r:
+                h_list.append(h_val)
+                w_list.append(w_val)
+                l_list.append(l_val)
+                z_list.append(z_val)
+                r_list.append(r_val)
 
-        w = np.ones_like(cx) * w
-        l = np.ones_like(cx) * l
-        h = np.ones_like(cx) * h
-
-        r_ = np.ones_like(cx)
-        for i in range(self.anchor_num):
-            r_[..., i] = r[i]
+        shape = (*cx_base.shape, self.anchor_num)
+        cx = np.repeat(cx_base[..., None], self.anchor_num, axis=-1)
+        cy = np.repeat(cy_base[..., None], self.anchor_num, axis=-1)
+        cz = np.broadcast_to(np.asarray(z_list, dtype=np.float32), shape).copy()
+        h = np.broadcast_to(np.asarray(h_list, dtype=np.float32), shape).copy()
+        w = np.broadcast_to(np.asarray(w_list, dtype=np.float32), shape).copy()
+        l = np.broadcast_to(np.asarray(l_list, dtype=np.float32), shape).copy()
+        r_ = np.broadcast_to(np.asarray(r_list, dtype=np.float32), shape).copy()
 
         if self.params["order"] == "hwl":  # pointpillar
-            anchors = np.stack([cx, cy, cz, h, w, l, r_], axis=-1)  # (50, 176, 2, 7)
+            anchors = np.stack([cx, cy, cz, h, w, l, r_], axis=-1)
 
         elif self.params["order"] == "lhw":
             anchors = np.stack([cx, cy, cz, l, h, w, r_], axis=-1)
