@@ -302,7 +302,11 @@ class Airv2xGaussian0822(nn.Module):
         current = self.state_dict()
         unexpected = [key for key in state if key not in current]
         if unexpected:
-            raise KeyError(f"ckpt keys not in model: {unexpected[:8]}")
+            print(
+                f"[P1] ignoring {len(unexpected)} checkpoint-only keys; "
+                f"examples={unexpected[:8]}"
+            )
+            state = {key: value for key, value in state.items() if key in current}
         missing = [
             key for key in current
             if self._p1_key_required(key) and key not in state
