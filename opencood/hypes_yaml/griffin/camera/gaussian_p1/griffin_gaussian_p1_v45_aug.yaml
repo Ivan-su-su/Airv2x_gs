@@ -1,0 +1,115 @@
+name: griffin_gaussian_p1_v45_aug
+dataset:
+  root: /mnt/home/suyi/Griffin/datasets/griffin_50scenes_55m/griffin-release
+  split_json: /mnt/home/suyi/Griffin/data/split_datas/griffin_50scenes_55m.json
+  final_dim:
+  - 360
+  - 640
+  vehicle_stride: 8
+  drone_stride: 4
+  lidar_num_features: 4
+  mask_foreground_mode: carla_semantic
+  target_semantic_tags:
+  - 12
+  - 14
+  - 15
+  - 16
+  - 18
+  - 19
+  max_mask_foreground_ratio: 0.98
+  # No photometric distortion (user request).
+  photometric_distortion: false
+  # Each official val scene: 30% of frames join train, 70% stay val-only.
+  val_frame_train_fraction: 0.3
+  val_frame_split_seed: 20260921
+  # Griffin RandomScaleImageMultiViewImage(scales=[0.5]); train/val same scale.
+  griffin_image_scale: 0.5
+  seed: 20260918
+model:
+  heatmap_num_classes: 2
+  vehicle:
+    cam:
+      grid_conf:
+        xbound:
+        - -51.2
+        - 51.2
+        - 0.4
+        ybound:
+        - -51.2
+        - 51.2
+        - 0.4
+        zbound:
+        - -5
+        - 3
+        - 8.0
+        ddiscr:
+        - 0
+        - 50
+        - 50
+        mode: LID
+      data_aug_conf:
+        final_dim:
+        - 360
+        - 640
+      img_downsample: 8
+      img_features: 64
+      use_depth_gt: false
+      depth_supervision: true
+  drone:
+    cam:
+      grid_conf:
+        xbound:
+        - -51.2
+        - 51.2
+        - 0.4
+        ybound:
+        - -51.2
+        - 51.2
+        - 0.4
+        zbound:
+        - -65
+        - -50
+        - 15.0
+        ddiscr:
+        - 6
+        - 150
+        - 144
+        mode: UD
+      data_aug_conf:
+        final_dim:
+        - 360
+        - 640
+      img_downsample: 8
+      img_features: 64
+      use_depth_gt: false
+      depth_supervision: false
+loss:
+  heatmap_gamma: 2.0
+  vehicle_heatmap_weight: 1.0
+  drone_heatmap_weight: 1.0
+  vehicle_depth_weight: 1.0
+depth_loss:
+  alpha: 0.25
+  gamma: 2.0
+  smooth_target: false
+  metric_lambda: 0.3
+optimizer:
+  trunk_lr: 0.0002
+  feature_lr: 0.002
+  head_lr: 0.002
+  eps: 1.0e-10
+  weight_decay: 0.0001
+train:
+  output_dir: opencood/logs/griffin_gaussian_p1_v45_scratch50_aug
+  epochs: 50
+  batch_size: 2
+  workers: 8
+  amp: true
+  grad_clip: 10.0
+  save_every: 5
+lr_scheduler:
+  milestones:
+  - 10
+  - 25
+  - 40
+  gamma: 0.1

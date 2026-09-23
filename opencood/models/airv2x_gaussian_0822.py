@@ -136,7 +136,8 @@ class Airv2xGaussian0822(nn.Module):
 
         refinement_cfg = args["gaussian_refinement"]
         encoder = GaussianGeometryEncoder(
-            geo_dim=int(refinement_cfg["geometry"]["geo_dim"])
+            geo_dim=int(refinement_cfg["geometry"]["geo_dim"]),
+            cav_range=args["cav_range"],
         )
         stage1_sampler = GaussianOffsetSampler(
             feature_dim=F90_CHANNELS, geometry_encoder=encoder

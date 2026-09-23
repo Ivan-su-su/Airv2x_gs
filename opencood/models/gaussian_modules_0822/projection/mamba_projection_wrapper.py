@@ -176,6 +176,66 @@ class MambaProjectionWrapper(nn.Module):
         super().__init__()
         self.expand_scale = float(expand_scale)
         self.align_corners = bool(align_corners)
+        self._sampling_coord_cache: Dict[
+            Tuple[int, int, int, int, bool],
+            Tuple[float, float, float, float, float, float],
+        ] = {}
+
+    def _sampling_coord_params(
+        self,
+        image_hw: Tuple[int, int],
+        feature_hw: Tuple[int, int],
+    ) -> Tuple[float, float, float, float, float, float]:
+        """Return cached LSS-pixel → feature/grid affine parameters.
+
+        ``map_points`` returns ``uv_norm = (u / W_img, v / H_img)``.
+        AirV2X/LSS places feature cells with endpoint linspace coordinates:
+
+            x_feat = u * (W_feat - 1) / (W_img - 1)
+            y_feat = v * (H_feat - 1) / (H_img - 1)
+
+        ``grid_sample`` then needs those feature coordinates converted using
+        its own ``align_corners`` convention. Image/feature resolutions are
+        static for a run, so the scalar affine coefficients are cached.
+        """
+        image_h, image_w = int(image_hw[0]), int(image_hw[1])
+        feat_h, feat_w = int(feature_hw[0]), int(feature_hw[1])
+        if min(image_h, image_w, feat_h, feat_w) <= 1:
+            raise ValueError(
+                "image/feature dimensions must be > 1, got "
+                f"image_hw={image_hw}, feature_hw={feature_hw}"
+            )
+
+        key = (image_h, image_w, feat_h, feat_w, self.align_corners)
+        cached = self._sampling_coord_cache.get(key)
+        if cached is not None:
+            return cached
+
+        feat_x_scale = (
+            float(image_w) * float(feat_w - 1) / float(image_w - 1)
+        )
+        feat_y_scale = (
+            float(image_h) * float(feat_h - 1) / float(image_h - 1)
+        )
+
+        if self.align_corners:
+            grid_x_scale = 2.0 * float(image_w) / float(image_w - 1)
+            grid_x_bias = -1.0
+            grid_y_scale = 2.0 * float(image_h) / float(image_h - 1)
+            grid_y_bias = -1.0
+        else:
+            grid_x_scale = 2.0 * feat_x_scale / float(feat_w)
+            grid_x_bias = 1.0 / float(feat_w) - 1.0
+            grid_y_scale = 2.0 * feat_y_scale / float(feat_h)
+            grid_y_bias = 1.0 / float(feat_h) - 1.0
+
+        params = (
+            feat_x_scale, feat_y_scale,
+            grid_x_scale, grid_x_bias,
+            grid_y_scale, grid_y_bias,
+        )
+        self._sampling_coord_cache[key] = params
+        return params
 
     def project(
         self,
@@ -240,14 +300,35 @@ class MambaProjectionWrapper(nn.Module):
             )
 
         feat_h, feat_w = feature_hw if feature_hw is not None else image_hw
+        (
+            feat_x_scale,
+            feat_y_scale,
+            grid_x_scale,
+            grid_x_bias,
+            grid_y_scale,
+            grid_y_bias,
+        ) = self._sampling_coord_params(
+            image_hw=image_hw,
+            feature_hw=(int(feat_h), int(feat_w)),
+        )
         uv_feat = torch.stack(
-            [uv_norm[..., 0] * float(feat_w), uv_norm[..., 1] * float(feat_h)],
+            [
+                uv_norm[..., 0] * feat_x_scale,
+                uv_norm[..., 1] * feat_y_scale,
+            ],
+            dim=-1,
+        )
+        uv_grid = torch.stack(
+            [
+                uv_norm[..., 0] * grid_x_scale + grid_x_bias,
+                uv_norm[..., 1] * grid_y_scale + grid_y_bias,
+            ],
             dim=-1,
         )
         return {
             "uv_norm": uv_norm,
             "uv_feat": uv_feat,
-            "uv_grid": uv_norm * 2.0 - 1.0,
+            "uv_grid": uv_grid,
             "valid_mask": valid_mask,
         }
 

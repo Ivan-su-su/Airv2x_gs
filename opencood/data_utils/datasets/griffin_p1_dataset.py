@@ -22,7 +22,7 @@ import json
 import math
 import os
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
 
 import cv2
 import numpy as np
@@ -95,26 +95,27 @@ def _match_split_scene(raw_name: str, split_name: str) -> bool:
     return split_name == raw_name or split_name.endswith("-" + raw_name)
 
 
-def resolve_split_frames(
-    vehicle_root: Path,
-    split: str,
-    split_json: Optional[Path],
-) -> List[str]:
-    scenes = _load_scene_infos(vehicle_root)
-    split = str(split)
-    if split not in ("train", "val"):
-        raise ValueError(f"split must be train/val, got {split}")
+def _split_scene_names(split_json: Path, split: str) -> List[str]:
+    """Read one split's scene-name list from the official split JSON."""
+    split_data = _read_json(split_json)
+    # Official Griffin split JSON uses:
+    # {"batch_split": {"train": [...], "val": [...]}}
+    # Also keep compatibility with a flat train/val JSON.
+    split_block = split_data.get("batch_split", split_data)
+    if not isinstance(split_block, Mapping):
+        raise ValueError(f"unexpected split json structure: {split_json}")
+    return [str(x) for x in split_block.get(split, [])]
 
+
+def _selected_scenes_for_split(
+    scenes: List[Mapping[str, Any]],
+    split_json: Optional[Path],
+    split: str,
+) -> List[Mapping[str, Any]]:
+    """Map official split JSON scene names to ``scene_infos`` entries."""
     selected: List[Mapping[str, Any]] = []
     if split_json is not None and split_json.exists():
-        split_data = _read_json(split_json)
-        # Official Griffin split JSON uses:
-        # {"batch_split": {"train": [...], "val": [...]}}
-        # Also keep compatibility with a flat train/val JSON.
-        split_block = split_data.get("batch_split", split_data)
-        if not isinstance(split_block, Mapping):
-            raise ValueError(f"unexpected split json structure: {split_json}")
-        names = [str(x) for x in split_block.get(split, [])]
+        names = _split_scene_names(split_json, split)
         if not names:
             raise ValueError(f"{split_json} has no non-empty '{split}' list")
         unmatched = list(names)
@@ -133,20 +134,122 @@ def resolve_split_frames(
                 f"First unmatched={unmatched[:5]}, raw examples={examples}."
             )
     else:
-        # Safe deterministic fallback only. Prefer the official split JSON.
         cut = max(1, int(round(0.8 * len(scenes))))
         selected = scenes[:cut] if split == "train" else scenes[cut:]
         print(
             "[GriffinP1Dataset] WARNING: official split_json missing; using "
             f"deterministic scene 80/20 fallback for {split}."
         )
+    return selected
 
-    frames: List[str] = []
+
+def _pick_val_frames_per_scene_for_train(
+    scenes: List[Mapping[str, Any]],
+    val_names: Sequence[str],
+    fraction: float,
+    seed: int,
+) -> Dict[str, List[str]]:
+    """Per val scene, pick a fixed fraction of frames for extra train supervision."""
+    rng = np.random.RandomState(int(seed))
+    picked: Dict[str, List[str]] = {}
+    for val_name in sorted(set(str(x) for x in val_names)):
+        matched = False
+        for i, scene in enumerate(scenes):
+            raw_name = _scene_name(scene, i)
+            if not _match_split_scene(raw_name, val_name):
+                continue
+            frames = _scene_frames(scene)
+            n = len(frames)
+            count = int(round(float(fraction) * n))
+            count = min(max(count, 0), n)
+            if count > 0:
+                idx = sorted(int(j) for j in rng.choice(n, size=count, replace=False))
+                picked[val_name] = [frames[j] for j in idx]
+            else:
+                picked[val_name] = []
+            matched = True
+            break
+        if not matched:
+            raise ValueError(f"val scene not found in scene_infos: {val_name}")
+    return picked
+
+
+def resolve_split_frames(
+    vehicle_root: Path,
+    split: str,
+    split_json: Optional[Path],
+    val_frame_train_fraction: float = 0.0,
+    val_frame_split_seed: int = 20260921,
+) -> List[str]:
+    """Resolve frame ids for train/val with optional per-val-scene frame split.
+
+    When ``val_frame_train_fraction`` > 0, each official val scene contributes
+    that fraction of its frames to train; the remaining frames stay val-only.
+    All 10 val scenes remain in val (no whole-scene removal).
+    """
+    scenes = _load_scene_infos(vehicle_root)
+    split = str(split)
+    if split not in ("train", "val"):
+        raise ValueError(f"split must be train/val, got: {split}")
+
+    extra_train_frames: Set[str] = set()
+    frac = float(val_frame_train_fraction)
+    if frac > 0.0:
+        if split_json is None or not split_json.exists():
+            raise ValueError("val_frame_train_fraction requires the official split_json")
+        val_names = _split_scene_names(split_json, "val")
+        picked = _pick_val_frames_per_scene_for_train(
+            scenes, val_names, frac, int(val_frame_split_seed)
+        )
+        for frames in picked.values():
+            extra_train_frames.update(frames)
+        total_val_frames = sum(
+            len(_scene_frames(scene))
+            for i, scene in enumerate(scenes)
+            if any(
+                _match_split_scene(_scene_name(scene, i), name)
+                for name in val_names
+            )
+        )
+        if split == "train":
+            print(
+                f"[GriffinP1Dataset] val_frame_train_fraction={frac:g} seed={val_frame_split_seed}: "
+                f"picked {len(extra_train_frames)}/{total_val_frames} val frames into train "
+                f"across {len(picked)} val scenes"
+            )
+            for name in sorted(picked.keys()):
+                scene_len = 0
+                for i, scene in enumerate(scenes):
+                    if _match_split_scene(_scene_name(scene, i), name):
+                        scene_len = len(_scene_frames(scene))
+                        break
+                print(f"  {name}: {len(picked[name])}/{scene_len} frames -> train")
+
+    if split == "train":
+        selected = _selected_scenes_for_split(scenes, split_json, "train")
+        frames: List[str] = []
+        seen: Set[str] = set()
+        for scene in selected:
+            for frame in _scene_frames(scene):
+                if frame not in seen:
+                    seen.add(frame)
+                    frames.append(frame)
+        for frame in sorted(extra_train_frames):
+            if frame not in seen:
+                seen.add(frame)
+                frames.append(frame)
+        return frames
+
+    selected = _selected_scenes_for_split(scenes, split_json, "val")
+    frames = []
     for scene in selected:
-        frames.extend(_scene_frames(scene))
+        for frame in _scene_frames(scene):
+            if frame not in extra_train_frames:
+                frames.append(frame)
     return frames
 
 
+<<<<<<< HEAD
 def photometric_distortion_bgr(img: np.ndarray, rng: np.random.RandomState) -> np.ndarray:
     """Dependency-light replica of Griffin's PhotoMetricDistortionMultiViewImage.
 
@@ -205,6 +308,41 @@ def _bgr_to_normalized_tensor(
         work, (final_w, final_h), interpolation=cv2.INTER_LINEAR
     )
     rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
+=======
+def _scale_bgr_to_final(
+    bgr: np.ndarray,
+    final_hw: Tuple[int, int],
+    image_scale: float,
+) -> np.ndarray:
+    """Griffin ``RandomScaleImageMultiViewImage(scales=[0.5])`` then resize to P1 ``final_dim``."""
+    orig_h, orig_w = int(bgr.shape[0]), int(bgr.shape[1])
+    final_h, final_w = int(final_hw[0]), int(final_hw[1])
+    scale = float(image_scale)
+    mid_w = max(1, int(round(orig_w * scale)))
+    mid_h = max(1, int(round(orig_h * scale)))
+    mid = cv2.resize(bgr, (mid_w, mid_h), interpolation=cv2.INTER_LINEAR)
+    return cv2.resize(mid, (final_w, final_h), interpolation=cv2.INTER_LINEAR)
+
+
+def _scale_mask_to_final(
+    fg: np.ndarray,
+    final_hw: Tuple[int, int],
+    image_scale: float,
+) -> np.ndarray:
+    """NEAREST scale for instance masks, same geometry as ``_scale_bgr_to_final``."""
+    orig_h, orig_w = int(fg.shape[0]), int(fg.shape[1])
+    final_h, final_w = int(final_hw[0]), int(final_hw[1])
+    scale = float(image_scale)
+    mid_w = max(1, int(round(orig_w * scale)))
+    mid_h = max(1, int(round(orig_h * scale)))
+    mid = cv2.resize(fg.astype(np.uint8), (mid_w, mid_h), interpolation=cv2.INTER_NEAREST)
+    return cv2.resize(mid, (final_w, final_h), interpolation=cv2.INTER_NEAREST).astype(bool)
+
+
+def _bgr_to_normalized_tensor(bgr: np.ndarray, final_hw: Tuple[int, int], image_scale: float) -> torch.Tensor:
+    scaled = _scale_bgr_to_final(bgr, final_hw, image_scale)
+    rgb = cv2.cvtColor(scaled, cv2.COLOR_BGR2RGB)
+>>>>>>> 9686219 (WIP: local Griffin geometry and P1 changes)
     tensor = torch.from_numpy(rgb).permute(2, 0, 1).contiguous().float() / 255.0
     return imagenet_normalize_display_rgb(tensor)
 
@@ -424,6 +562,7 @@ def project_lidar_to_camera_cells(
     final_hw: Tuple[int, int],
     stride: int,
     foreground_mask: np.ndarray,
+    image_scale: float = 0.5,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """Project object LiDAR points to camera and keep nearest optical-z per P1 cell."""
     orig_h, orig_w = int(original_hw[0]), int(original_hw[1])
@@ -457,12 +596,15 @@ def project_lidar_to_camera_cells(
     v = v[in_img]
     z = z[in_img]
 
-    # Only points projected onto Griffin object pixels supervise depth.
+    # on_object at original resolution; then Griffin scale + resize to final_dim.
     ui = np.floor(u).astype(np.int64)
     vi = np.floor(v).astype(np.int64)
     on_object = foreground_mask[vi, ui]
-    u = u[on_object] * (float(final_w) / float(orig_w))
-    v = v[on_object] * (float(final_h) / float(orig_h))
+    scale = float(image_scale)
+    mid_w = max(float(orig_w) * scale, 1.0)
+    mid_h = max(float(orig_h) * scale, 1.0)
+    u = u[on_object] * scale * (float(final_w) / mid_w)
+    v = v[on_object] * scale * (float(final_h) / mid_h)
     z = z[on_object]
 
     j = np.floor(u / stride).astype(np.int64)
@@ -504,12 +646,22 @@ class GriffinP1Dataset(Dataset):
             )
         )
         self.max_mask_fg_ratio = float(self.cfg.get("max_mask_foreground_ratio", 0.98))
-        self.photometric = bool(self.cfg.get("photometric_distortion", True)) and self.split == "train"
         self.seed = int(self.cfg.get("seed", 20260918))
+        self.image_scale = float(self.cfg.get("griffin_image_scale", 0.5))
+        self.val_frame_train_fraction = float(
+            self.cfg.get("val_frame_train_fraction", 0.0)
+        )
+        self.val_frame_split_seed = int(self.cfg.get("val_frame_split_seed", 20260921))
 
         split_json_value = self.cfg.get("split_json")
         split_json = Path(split_json_value).expanduser().resolve() if split_json_value else None
-        raw_frames = resolve_split_frames(self.vehicle_root, self.split, split_json)
+        raw_frames = resolve_split_frames(
+            self.vehicle_root,
+            self.split,
+            split_json,
+            val_frame_train_fraction=self.val_frame_train_fraction,
+            val_frame_split_seed=self.val_frame_split_seed,
+        )
         self.frames = [f for f in raw_frames if self._frame_complete(f)]
         missing = len(raw_frames) - len(self.frames)
         if not self.frames:
@@ -532,9 +684,14 @@ class GriffinP1Dataset(Dataset):
 
         print(
             f"[GriffinP1Dataset] split={self.split} frames={len(self.frames)} "
+<<<<<<< HEAD
             f"final={self.final_hw} image_scale={self.image_scale} "
             f"veh_stride={self.vehicle_stride} drone_stride={self.drone_stride} "
             f"photometric={self.photometric}"
+=======
+            f"final={self.final_hw} veh_stride={self.vehicle_stride} "
+            f"drone_stride={self.drone_stride} griffin_image_scale={self.image_scale}"
+>>>>>>> 9686219 (WIP: local Griffin geometry and P1 changes)
         )
 
     def _frame_complete(self, frame: str) -> bool:
@@ -552,10 +709,6 @@ class GriffinP1Dataset(Dataset):
         return len(self.frames)
 
     def _rng(self, index: int, view_offset: int) -> np.random.RandomState:
-        if self.photometric:
-            # Each worker has its own numpy RNG state; draw a fresh seed so
-            # Griffin photometric distortion changes across epochs/views.
-            return np.random.RandomState(np.random.randint(0, 2**31 - 1))
         return np.random.RandomState(self.seed + index * 31 + view_offset * 1009)
 
     def _load_view(
@@ -573,11 +726,14 @@ class GriffinP1Dataset(Dataset):
         if bgr is None:
             raise FileNotFoundError(rgb_path)
         original_hw = (int(bgr.shape[0]), int(bgr.shape[1]))
+<<<<<<< HEAD
         if self.photometric:
             bgr = photometric_distortion_bgr(bgr.astype(np.float32), rng)
         img_t = _bgr_to_normalized_tensor(
             bgr, self.final_hw, self.image_scale
         )
+=======
+>>>>>>> 9686219 (WIP: local Griffin geometry and P1 changes)
 
         mask = cv2.imread(str(mask_path), cv2.IMREAD_UNCHANGED)
         if mask is None:
@@ -594,10 +750,9 @@ class GriffinP1Dataset(Dataset):
                 f"{fg_ratio_raw:.3f} > {self.max_mask_fg_ratio:.3f}. Do NOT train "
                 "until mask encoding is checked with check_griffin_p1_data.py."
             )
-        final_h, final_w = self.final_hw
-        fg_rs = cv2.resize(
-            fg.astype(np.uint8), (final_w, final_h), interpolation=cv2.INTER_NEAREST
-        ).astype(bool)
+
+        img_t = _bgr_to_normalized_tensor(bgr, self.final_hw, self.image_scale)
+        fg_rs = _scale_mask_to_final(fg, self.final_hw, self.image_scale)
         target = _block_any(fg_rs, stride).astype(np.int64)
         return img_t, torch.from_numpy(target).long(), original_hw, fg, fg_ratio_raw
 
@@ -632,6 +787,7 @@ class GriffinP1Dataset(Dataset):
                 self.final_hw,
                 self.vehicle_stride,
                 fg_mask,
+                image_scale=self.image_scale,
             )
             vehicle_imgs.append(img_t)
             vehicle_hm.append(hm_t)
