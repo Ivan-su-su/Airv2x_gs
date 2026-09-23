@@ -218,25 +218,82 @@ class IntermediateFusionDatasetGriffin(Dataset):
             "camera_world_z": torch.tensor(camera_world_z, dtype=torch.float32),
         }
 
+    @staticmethod
+    def _read_label_rows(path: Path) -> List[List[str]]:
+        if not path.exists():
+            return []
+        return [
+            line.strip().split()
+            for line in path.read_text().splitlines()
+            if line.strip()
+        ]
+
     def _load_boxes(
-        self, frame: str
+        self,
+        frame: str,
+        t_drone_to_vehicle: np.ndarray,
     ) -> Tuple[np.ndarray, np.ndarray, List[str], List[int]]:
-        path = self.vehicle_root / "label" / f"{frame}.txt"
+        """Match Griffin cooperative GT: vehicle labels + drone-only labels."""
+        vehicle_rows = self._read_label_rows(
+            self.vehicle_root / "label" / f"{frame}.txt"
+        )
+        drone_rows = self._read_label_rows(
+            self.drone_root / "label" / f"{frame}.txt"
+        )
+
+        vehicle_ids = {
+            row[10] for row in vehicle_rows if len(row) > 10
+        }
+        rows: List[Tuple[List[str], bool]] = [
+            (row, False) for row in vehicle_rows
+        ]
+        rows.extend(
+            (row, True)
+            for row in drone_rows
+            if len(row) > 10 and row[10] not in vehicle_ids
+        )
+
         boxes: List[List[float]] = []
         object_ids: List[str] = []
         class_ids: List[int] = []
 
-        for line in path.read_text().splitlines():
-            fields = line.strip().split()
+        for fields, from_drone in rows:
             if len(fields) < 10:
                 continue
             class_id = _CLASS_ID.get(fields[0].lower())
             if class_id is None:
                 continue
+
             x, y, z = map(float, fields[1:4])
             l, w, h = map(float, fields[4:7])
-            yaw_deg = float(fields[9])
-            object_id = fields[10] if len(fields) > 10 else f"{frame}_{len(boxes)}"
+            roll_deg, pitch_deg, yaw_deg = map(float, fields[7:10])
+            object_id = (
+                fields[10]
+                if len(fields) > 10
+                else f"{frame}_{len(boxes)}"
+            )
+
+            if from_drone:
+                t_obj_to_drone = np.eye(4, dtype=np.float64)
+                t_obj_to_drone[:3, :3] = SciRot.from_euler(
+                    "xyz",
+                    [roll_deg, pitch_deg, yaw_deg],
+                    degrees=True,
+                ).as_matrix()
+                t_obj_to_drone[:3, 3] = [x, y, z]
+                t_obj_to_vehicle = t_drone_to_vehicle @ t_obj_to_drone
+                x, y, z = t_obj_to_vehicle[:3, 3].tolist()
+                yaw = float(
+                    SciRot.from_matrix(
+                        t_obj_to_vehicle[:3, :3]
+                    ).as_euler("xyz", degrees=False)[2]
+                )
+                # Griffin converter removes the ego vehicle if it appears
+                # only in the aerial annotation list.
+                if np.linalg.norm(t_obj_to_vehicle[:2, 3]) < 0.1:
+                    continue
+            else:
+                yaw = float(np.deg2rad(yaw_deg))
 
             if not (
                 self.det_range[0] <= x <= self.det_range[3]
@@ -245,8 +302,7 @@ class IntermediateFusionDatasetGriffin(Dataset):
             ):
                 continue
 
-            # OpenCOOD hwl order: [x,y,z,h,w,l,yaw(rad)].
-            boxes.append([x, y, z, h, w, l, np.deg2rad(yaw_deg)])
+            boxes.append([x, y, z, h, w, l, yaw])
             object_ids.append(str(object_id))
             class_ids.append(int(class_id))
 
@@ -296,7 +352,9 @@ class IntermediateFusionDatasetGriffin(Dataset):
             )
             d_depth.append(torch.from_numpy(depth).float())
 
-        center, mask, object_ids, class_ids = self._load_boxes(frame)
+        center, mask, object_ids, class_ids = self._load_boxes(
+            frame, t_drone_to_vehicle
+        )
         class_ids_padded = np.zeros((self.max_num,), dtype=np.int64)
         class_ids_padded[:len(class_ids)] = np.asarray(class_ids, dtype=np.int64)
         label_dict = self.post_processor.generate_label_airv2x(
