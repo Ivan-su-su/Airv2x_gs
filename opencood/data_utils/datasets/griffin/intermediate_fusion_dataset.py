@@ -119,6 +119,11 @@ class IntermediateFusionDatasetGriffin(Dataset):
             if split_json_value
             else None
         )
+        if split_json is None or not split_json.exists():
+            raise FileNotFoundError(
+                "Griffin full detection requires the official split_json; "
+                f"got {split_json}"
+            )
         self.final_hw = tuple(int(v) for v in cfg.get("final_dim", [360, 640]))
         self.image_scale = float(cfg.get("image_scale", 0.5))
         self.drone_stride = int(cfg.get("drone_stride", 4))
