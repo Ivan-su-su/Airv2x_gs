@@ -58,6 +58,9 @@ from opencood.data_utils.datasets.airv2x.intermediate_fusion_dataset_bm2cp impor
 from opencood.data_utils.datasets.airv2x.intermediate_fusion_dataset_sicp import (
     IntermediateFusionDatasetAirv2xSiCP,
 )
+from opencood.data_utils.datasets.griffin.intermediate_fusion_dataset import (
+    IntermediateFusionDatasetGriffin,
+)
 
 __all__ = {
     "EarlyFusionDatasetOPV2V": EarlyFusionDatasetOPV2V,
@@ -79,6 +82,7 @@ __all__ = {
     "IntermediateFusionDatasetAirv2x": IntermediateFusionDatasetAirv2x,
     "IntermediateFusionDatasetAirv2xBM2CP": IntermediateFusionDatasetAirv2xBM2CP,
     "IntermediateFusionDatasetAirv2xSiCP": IntermediateFusionDatasetAirv2xSiCP,
+    "IntermediateFusionDatasetGriffin": IntermediateFusionDatasetGriffin,
 }
 
 # the final range for evaluation
