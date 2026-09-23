@@ -76,12 +76,26 @@ class Airv2xGaussian0822(nn.Module):
     def __init__(self, args: Dict[str, Any]) -> None:
         super().__init__()
         self.args = args
+        self.active_agents = tuple(
+            str(agent) for agent in (args.get("collaborators") or AGENT_TYPES)
+        )
+        unknown_agents = sorted(set(self.active_agents).difference(AGENT_TYPES))
+        if unknown_agents:
+            raise ValueError(f"Unknown collaborators: {unknown_agents}")
+        self.drone_depth_mode = str(
+            args.get("drone_depth_mode", "learned_delta")
+        ).lower()
+        if self.drone_depth_mode not in ("learned_delta", "ideal_ground"):
+            raise ValueError(
+                "drone_depth_mode must be learned_delta or ideal_ground, "
+                f"got {self.drone_depth_mode}"
+            )
         self.vehicle_p1_v45 = bool(args.get("vehicle_p1_v45", False))
         geom_sup = args.get("geometry_supervision") or {}
         self.geometry_supervision_enabled = bool(geom_sup.get("enabled", False))
         self.geometry_supervision_beta = float(geom_sup.get("beta", 1.0))
         self.depth_ranges: Dict[str, Tuple[float, float]] = {}
-        for agent_type in AGENT_TYPES:
+        for agent_type in self.active_agents:
             cam_cfg = ((args.get(agent_type) or {}).get("cam") or {})
             ddiscr = (cam_cfg.get("grid_conf") or {}).get("ddiscr")
             if ddiscr is None or len(ddiscr) < 2:
@@ -234,6 +248,44 @@ class Airv2xGaussian0822(nn.Module):
         "depth_moments",
     )
 
+    def _p1_key_required(self, key: str) -> bool:
+        """Whether a frozen P1 tensor is required by this dataset/model mode."""
+        if key.startswith("frontend.encoders."):
+            return any(
+                key.startswith(f"frontend.encoders.{agent}.")
+                for agent in self.active_agents
+            )
+        if key.startswith("highres."):
+            return any(
+                key.startswith(f"highres.{agent}.")
+                for agent in self.active_agents
+            )
+        if key.startswith("heatmap_heads."):
+            return any(
+                key.startswith(f"heatmap_heads.{agent}.")
+                for agent in self.active_agents
+            )
+        if key.startswith("depth_heads."):
+            return any(
+                agent in CATEGORICAL_DEPTH_AGENTS
+                and key.startswith(f"depth_heads.{agent}.")
+                for agent in self.active_agents
+            )
+        if key.startswith("depth_moments."):
+            return any(
+                agent in CATEGORICAL_DEPTH_AGENTS
+                and key.startswith(f"depth_moments.{agent}.")
+                for agent in self.active_agents
+            )
+        if key.startswith("r2_downsample."):
+            return self.vehicle_p1_v45 and "vehicle" in self.active_agents
+        if key.startswith(("drone_height_embed.", "drone_delta_head.")):
+            return (
+                "drone" in self.active_agents
+                and self.drone_depth_mode == "learned_delta"
+            )
+        return False
+
     def _load_and_freeze_frontend(self, path: str) -> None:
         """Load the P1 image stack from ``path`` and freeze it.
 
@@ -251,11 +303,9 @@ class Airv2xGaussian0822(nn.Module):
         unexpected = [key for key in state if key not in current]
         if unexpected:
             raise KeyError(f"ckpt keys not in model: {unexpected[:8]}")
-        frozen = self._frozen_module_names()
         missing = [
-            key
-            for key in current
-            if key.split(".")[0] in frozen and key not in state
+            key for key in current
+            if self._p1_key_required(key) and key not in state
         ]
         if missing:
             raise KeyError(f"frozen keys missing from ckpt: {missing[:8]}")
@@ -298,6 +348,29 @@ class Airv2xGaussian0822(nn.Module):
         payload["f90"] = f90
         payload["heatmap_logits"] = heatmap_logits
         if agent_type == "drone":
+            if self.drone_depth_mode == "ideal_ground":
+                depth_z = payload.get("ideal_depth_z")
+                if not torch.is_tensor(depth_z):
+                    raise KeyError(
+                        "drone_depth_mode=ideal_ground requires "
+                        "data_dict['drone']['ideal_depth_z']"
+                    )
+                depth_z = depth_z.to(device=f90.device, dtype=f90.dtype)
+                if depth_z.dim() == 4 and int(depth_z.shape[1]) == 1:
+                    depth_z = depth_z[:, 0]
+                expected = (
+                    int(f90.shape[0]),
+                    int(f90.shape[2]),
+                    int(f90.shape[3]),
+                )
+                if tuple(depth_z.shape) != expected:
+                    raise ValueError(
+                        f"drone ideal_depth_z {tuple(depth_z.shape)} "
+                        f"expected {expected}"
+                    )
+                payload["depth_z_mean"] = depth_z
+                return
+
             cam_inputs = payload["batch_merged_cam_inputs"]
             height = flatten_camera_world_z(cam_inputs["camera_world_z"], imgs)
             height = height.to(device=f90.device, dtype=f90.dtype)
