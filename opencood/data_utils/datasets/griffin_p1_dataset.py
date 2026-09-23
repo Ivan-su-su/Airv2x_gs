@@ -183,12 +183,37 @@ def photometric_distortion_bgr(img: np.ndarray, rng: np.random.RandomState) -> n
     return np.clip(out, 0.0, 255.0).astype(np.float32)
 
 
-def _rgb_to_normalized_tensor(bgr: np.ndarray, final_hw: Tuple[int, int]) -> torch.Tensor:
+def _bgr_to_normalized_tensor(
+    bgr: np.ndarray,
+    final_hw: Tuple[int, int],
+    image_scale: float,
+) -> torch.Tensor:
+    """Match Griffin P1 preprocessing exactly: scale first, then final resize."""
+    scale = float(image_scale)
+    if scale <= 0.0:
+        raise ValueError(f"image_scale must be > 0, got {scale}")
+    work = bgr
+    if abs(scale - 1.0) > 1.0e-8:
+        src_h, src_w = int(bgr.shape[0]), int(bgr.shape[1])
+        scaled_w = max(1, int(round(src_w * scale)))
+        scaled_h = max(1, int(round(src_h * scale)))
+        work = cv2.resize(
+            bgr, (scaled_w, scaled_h), interpolation=cv2.INTER_LINEAR
+        )
     final_h, final_w = int(final_hw[0]), int(final_hw[1])
-    resized = cv2.resize(bgr, (final_w, final_h), interpolation=cv2.INTER_LINEAR)
+    resized = cv2.resize(
+        work, (final_w, final_h), interpolation=cv2.INTER_LINEAR
+    )
     rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
     tensor = torch.from_numpy(rgb).permute(2, 0, 1).contiguous().float() / 255.0
     return imagenet_normalize_display_rgb(tensor)
+
+
+def _rgb_to_normalized_tensor(
+    bgr: np.ndarray, final_hw: Tuple[int, int]
+) -> torch.Tensor:
+    """Backward-compatible one-step resize used by older debug scripts."""
+    return _bgr_to_normalized_tensor(bgr, final_hw, image_scale=1.0)
 
 
 def _mask_to_foreground(
@@ -452,6 +477,7 @@ class GriffinP1Dataset(Dataset):
         self.vehicle_root = self.root / "vehicle-side"
         self.drone_root = self.root / "drone-side"
         self.final_hw = tuple(int(x) for x in self.cfg.get("final_dim", [360, 640]))
+        self.image_scale = float(self.cfg.get("image_scale", 0.5))
         self.vehicle_stride = int(self.cfg.get("vehicle_stride", 8))
         self.drone_stride = int(self.cfg.get("drone_stride", 4))
         self.lidar_num_features = int(self.cfg.get("lidar_num_features", 4))
@@ -493,8 +519,9 @@ class GriffinP1Dataset(Dataset):
 
         print(
             f"[GriffinP1Dataset] split={self.split} frames={len(self.frames)} "
-            f"final={self.final_hw} veh_stride={self.vehicle_stride} "
-            f"drone_stride={self.drone_stride} photometric={self.photometric}"
+            f"final={self.final_hw} image_scale={self.image_scale} "
+            f"veh_stride={self.vehicle_stride} drone_stride={self.drone_stride} "
+            f"photometric={self.photometric}"
         )
 
     def _frame_complete(self, frame: str) -> bool:
@@ -535,7 +562,9 @@ class GriffinP1Dataset(Dataset):
         original_hw = (int(bgr.shape[0]), int(bgr.shape[1]))
         if self.photometric:
             bgr = photometric_distortion_bgr(bgr.astype(np.float32), rng)
-        img_t = _rgb_to_normalized_tensor(bgr, self.final_hw)
+        img_t = _bgr_to_normalized_tensor(
+            bgr, self.final_hw, self.image_scale
+        )
 
         mask = cv2.imread(str(mask_path), cv2.IMREAD_UNCHANGED)
         if mask is None:
