@@ -56,7 +56,7 @@ def main():
         args.model_dir,
         model,
         epoch=args.eval_epoch,
-        start_from_best=args.eval_epoch is None,
+        start_from_best=False,
         device=device,
     )
     model.eval()
