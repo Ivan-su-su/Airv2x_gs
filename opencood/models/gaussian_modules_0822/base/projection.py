@@ -124,6 +124,11 @@ def build_camera_geometry(
         "n_flat": n_flat,
         "n_views": n_views,
         "image_hw": image_hw,
+        # AirV2X keeps the historical LSS endpoint mapping. Griffin P1
+        # explicitly uses cell centers for heatmap/depth supervision.
+        "feature_sample_mode": str(
+            cam_inputs.get("feature_sample_mode", "lss_endpoint")
+        ),
     }
     for name, last in _REQUIRED_CAM_FIELDS:
         packed[name] = _flat_field(cam_inputs, name, last, n_flat)
@@ -357,8 +362,24 @@ def feature_indices_to_aug_pixels(
     feature_hw: Tuple[int, int],
     image_hw: Tuple[int, int],
     dtype: torch.dtype,
+    mode: str = "lss_endpoint",
 ) -> torch.Tensor:
-    """Feature cell → augmented-image pixel ``(u, v)``, shape ``[N, 2]``."""
+    """Feature cell to augmented-image pixel coordinates [N,2]."""
+    mode = str(mode)
+    height, width = float(image_hw[0]), float(image_hw[1])
+    feat_h, feat_w = int(feature_hw[0]), int(feature_hw[1])
+
+    if mode == "cell_center":
+        # Griffin P1 targets use block centers:
+        # stride-4 -> 2,6,10,... and stride-8 -> 4,12,20,...
+        pixel_x = (x_indices.to(dtype) + 0.5) * (width / float(feat_w))
+        pixel_y = (y_indices.to(dtype) + 0.5) * (height / float(feat_h))
+        return torch.stack([pixel_x, pixel_y], dim=-1)
+
+    if mode != "lss_endpoint":
+        raise ValueError(
+            f"feature sample mode must be lss_endpoint/cell_center, got {mode}"
+        )
     normalized = feature_indices_to_lss_normalized_coords(
         x_indices=x_indices.to(dtype),
         y_indices=y_indices.to(dtype),
@@ -366,11 +387,9 @@ def feature_indices_to_aug_pixels(
         image_hw=image_hw,
         dtype=dtype,
     )
-    height, width = float(image_hw[0]), float(image_hw[1])
     return torch.stack(
         [normalized[:, 0] * width, normalized[:, 1] * height], dim=-1
     )
-
 
 def lift_optical_z_to_lidar(
     uv_aug: torch.Tensor,
@@ -495,7 +514,12 @@ def backproject_optical_z(
         empty = depth_z.new_empty((0, 3))
         return empty, empty, depth_z.new_empty((0, 2))
     uv_aug = feature_indices_to_aug_pixels(
-        x_indices, y_indices, feature_hw, image_hw, dtype
+        x_indices,
+        y_indices,
+        feature_hw,
+        image_hw,
+        dtype,
+        mode=str(geometry.get("feature_sample_mode", "lss_endpoint")),
     )
     intrinsic = _gather_view(geometry["intrinsics"], view_index).to(dtype=dtype)
     post_rot = _gather_view(geometry["post_rots"], view_index).to(dtype=dtype)
