@@ -15,10 +15,9 @@ from torch.utils.data import Dataset
 import opencood.data_utils.post_processor as post_processor
 from opencood.data_utils.datasets.griffin_p1_dataset import (
     VEHICLE_CAMS,
+    _bgr_to_normalized_tensor,
     _load_calib,
     _read_json,
-    _rgb_to_normalized_tensor,
-    photometric_distortion_bgr,
     resolve_split_frames,
 )
 
@@ -121,11 +120,10 @@ class IntermediateFusionDatasetGriffin(Dataset):
             else None
         )
         self.final_hw = tuple(int(v) for v in cfg.get("final_dim", [360, 640]))
+        self.image_scale = float(cfg.get("image_scale", 0.5))
         self.drone_stride = int(cfg.get("drone_stride", 4))
         self.ground_z = float(cfg.get("ground_z", 0.0))
         self.max_ideal_depth = float(cfg.get("max_ideal_depth", 150.0))
-        self.photometric = bool(cfg.get("photometric_distortion", True)) and self.train
-        self.seed = int(cfg.get("seed", 20260923))
 
         raw_frames = resolve_split_frames(
             self.vehicle_root, self.split, split_json
@@ -141,18 +139,71 @@ class IntermediateFusionDatasetGriffin(Dataset):
             cam: _load_calib(self.drone_root, cam) for cam in DRONE_CAMS
         }
 
+        self.det_range = np.asarray(
+            params["postprocess"]["anchor_args"]["cav_lidar_range"],
+            dtype=np.float32,
+        )
+        self._configure_anchor_priors(split_json)
         self.post_processor = post_processor.build_postprocessor(
             params["postprocess"], dataset="airv2x", train=train
         )
         self.anchor_box = self.post_processor.generate_anchor_box()
         self.max_num = int(params["postprocess"].get("max_num", 300))
-        self.det_range = np.asarray(
-            params["postprocess"]["anchor_args"]["cav_lidar_range"],
-            dtype=np.float32,
-        )
         print(
             f"[GriffinDet] split={self.split} frames={len(self.frames)} "
-            f"vehicle=4cam drone=bottom final={self.final_hw}"
+            f"vehicle=4cam drone=bottom final={self.final_hw} "
+            f"image_scale={self.image_scale} photometric=False"
+        )
+
+    def _configure_anchor_priors(self, split_json: Path) -> None:
+        """Use Griffin TRAIN-label medians for class-specific anchor priors."""
+        anchor_args = self.params["postprocess"]["anchor_args"]
+        if anchor_args.get("sizes") != "auto_griffin_train_median":
+            return
+
+        train_frames = resolve_split_frames(
+            self.vehicle_root, "train", split_json
+        )
+        by_class = {1: [], 2: [], 3: []}
+        for frame in train_frames:
+            path = self.vehicle_root / "label" / f"{frame}.txt"
+            for fields in self._read_label_rows(path):
+                if len(fields) < 10:
+                    continue
+                class_id = _CLASS_ID.get(fields[0].lower())
+                if class_id is None:
+                    continue
+                x, y, z = map(float, fields[1:4])
+                if not (
+                    self.det_range[0] <= x <= self.det_range[3]
+                    and self.det_range[1] <= y <= self.det_range[4]
+                    and self.det_range[2] <= z <= self.det_range[5]
+                ):
+                    continue
+                l, w, h = map(float, fields[4:7])
+                by_class[class_id].append([h, w, l, z])
+
+        sizes = []
+        for class_id in (1, 2, 3):
+            values = np.asarray(by_class[class_id], dtype=np.float32)
+            if values.size == 0:
+                raise RuntimeError(
+                    f"No Griffin TRAIN boxes found for class_id={class_id}"
+                )
+            sizes.append(np.median(values, axis=0).tolist())
+
+        anchor_args["sizes"] = sizes
+        anchor_args["num"] = len(sizes) * len(anchor_args["r"])
+        expected = int(anchor_args["num"])
+        model_args = self.params["model"]["args"]
+        if int(model_args["anchor_number"]) != expected:
+            raise ValueError(
+                f"model.anchor_number={model_args['anchor_number']} "
+                f"but Griffin anchors require {expected}"
+            )
+        print(
+            "[GriffinDet] anchor priors [h,w,l,z] "
+            f"car/bicycle/pedestrian={sizes}"
         )
 
     def _frame_complete(self, frame: str) -> bool:
@@ -169,27 +220,21 @@ class IntermediateFusionDatasetGriffin(Dataset):
     def __len__(self) -> int:
         return len(self.frames)
 
-    def _rng(self, index: int, view_index: int) -> np.random.RandomState:
-        if self.photometric:
-            return np.random.RandomState(np.random.randint(0, 2**31 - 1))
-        return np.random.RandomState(self.seed + 37 * index + 1009 * view_index)
-
     def _camera_input(
         self,
         side_root: Path,
         cam: str,
         frame: str,
         t_agent_to_enu: np.ndarray,
-        rng: np.random.RandomState,
     ) -> Tuple[torch.Tensor, np.ndarray, np.ndarray, float]:
         path = side_root / "camera" / cam / f"{frame}.png"
         bgr = cv2.imread(str(path), cv2.IMREAD_COLOR)
         if bgr is None:
             raise FileNotFoundError(path)
         original_hw = (int(bgr.shape[0]), int(bgr.shape[1]))
-        if self.photometric:
-            bgr = photometric_distortion_bgr(bgr.astype(np.float32), rng)
-        img = _rgb_to_normalized_tensor(bgr, self.final_hw)
+        img = _bgr_to_normalized_tensor(
+            bgr, self.final_hw, self.image_scale
+        )
 
         t_cam_to_agent, intrinsic = _load_calib(side_root, cam)
         if intrinsic is None:
@@ -204,7 +249,7 @@ class IntermediateFusionDatasetGriffin(Dataset):
         intrinsics: List[np.ndarray],
         extrinsics: List[np.ndarray],
         camera_world_z: List[float],
-    ) -> Dict[str, torch.Tensor]:
+    ) -> Dict[str, Any]:
         ext = torch.from_numpy(np.stack(extrinsics)).float()
         return {
             "imgs": torch.stack(imgs, dim=0),
@@ -216,6 +261,8 @@ class IntermediateFusionDatasetGriffin(Dataset):
                 .unsqueeze(0).repeat(len(imgs), 1, 1),
             "post_trans": torch.zeros((len(imgs), 3), dtype=torch.float32),
             "camera_world_z": torch.tensor(camera_world_z, dtype=torch.float32),
+            # Griffin P1 targets/depth use cell centers, e.g. stride-4 -> 2,6,10,...
+            "feature_sample_mode": "cell_center",
         }
 
     @staticmethod
@@ -328,16 +375,14 @@ class IntermediateFusionDatasetGriffin(Dataset):
         v_imgs, v_ks, v_exts, v_z = [], [], [], []
         for view_idx, cam in enumerate(VEHICLE_CAMS):
             img, k, ext, world_z = self._camera_input(
-                self.vehicle_root, cam, frame, t_vehicle_to_enu,
-                self._rng(index, view_idx),
+                self.vehicle_root, cam, frame, t_vehicle_to_enu
             )
             v_imgs.append(img); v_ks.append(k); v_exts.append(ext); v_z.append(world_z)
 
         d_imgs, d_ks, d_exts, d_z, d_depth = [], [], [], [], []
         for view_idx, cam in enumerate(DRONE_CAMS):
             img, k, ext, world_z = self._camera_input(
-                self.drone_root, cam, frame, t_drone_to_enu,
-                self._rng(index, 100 + view_idx),
+                self.drone_root, cam, frame, t_drone_to_enu
             )
             d_imgs.append(img); d_ks.append(k); d_exts.append(ext); d_z.append(world_z)
             t_cam_to_enu = t_drone_to_enu @ ext
