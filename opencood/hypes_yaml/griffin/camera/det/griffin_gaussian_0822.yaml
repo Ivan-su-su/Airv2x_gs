@@ -1,0 +1,255 @@
+########
+# Name #
+########
+name: griffin_airv2x_gaussian_0822
+
+############
+# Training #
+############
+active_sensors: &active_sensors ["cam"]
+collaborators: &collaborators ["vehicle", "drone"]
+ego_type: &ego_type vehicle
+yaml_parser: "load_voxel_params"
+
+train_params:
+  batch_size: 1
+  epoches: 50
+  eval_freq: 2
+  save_freq: 1
+  max_cav:
+    vehicle: 1
+    rsu: 0
+    drone: 1
+
+###########
+# Dataset #
+###########
+root_dir: '/mnt/disk_4/suyi/Griffin/datasets/griffin_50scenes_55m/griffin-release'
+validate_dir: '/mnt/disk_4/suyi/Griffin/datasets/griffin_50scenes_55m/griffin-release'
+test_dir: '/mnt/disk_4/suyi/Griffin/datasets/griffin_50scenes_55m/griffin-release'
+
+griffin:
+  split_json: '/mnt/disk_4/suyi/Griffin/data/split_datas/griffin_50scenes_55m.json'
+  final_dim: [360, 640]
+  drone_stride: 4
+  ground_z: 0.0
+  max_ideal_depth: 150.0
+  photometric_distortion: true
+  seed: 20260923
+
+# background + {car, bicycle, pedestrian}
+num_class: &num_class 4
+num_anchor: &num_anchor 2
+task: &task "det"
+
+fusion:
+  core_method: 'IntermediateFusionDatasetGriffin'
+  args:
+    proj_first: true
+
+data_augment: []
+
+preprocess:
+  core_method: 'SpVoxelPreprocessor'
+  ego_type: *ego_type
+  args:
+    voxel_size: &voxel_size [0.4, 0.4, 8.0]
+    max_points_per_voxel: 32
+    max_voxel_train: 32000
+    max_voxel_test: 70000
+  cav_lidar_range: &cav_lidar [-51.2, -51.2, -5.0, 51.2, 51.2, 3.0]
+
+POINT_CLOUD_RANGE: *cav_lidar
+
+postprocess:
+  core_method: 'VoxelPostprocessor'
+  ego_type: *ego_type
+  anchor_args:
+    cav_lidar_range: *cav_lidar
+    l: 3.9
+    w: 1.6
+    h: 1.56
+    r: [0, 90]
+    feature_stride: 2
+    num: *num_anchor
+    num_class: *num_class
+  target_args:
+    pos_threshold: 0.60
+    neg_threshold: 0.45
+    score_threshold: 0.20
+    obj_threshold: 0.20
+  order: 'hwl'
+  max_num: 300
+  nms_thresh: 0.15
+
+#########
+# Model #
+#########
+model:
+  core_method: airv2x_gaussian_0822
+  args:
+    ego_type: *ego_type
+    collaborators: *collaborators
+    active_sensors: *active_sensors
+    max_cav:
+      vehicle: 1
+      rsu: 0
+      drone: 1
+    device: cuda
+    train: true
+    proj_first: true
+    supervise_single: false
+    backbone_fix: false
+
+    heatmap_num_classes: 2
+    vehicle_p1_v45: true
+    drone_depth_mode: ideal_ground
+    pretrained: '/mnt/home/suyi/AirV2X-Perception_gaussian/opencood/logs/griffin_gaussian_p1_v45_scratch50/latest.pth'
+    pretrained_v45: '/mnt/home/suyi/AirV2X-Perception_gaussian/opencood/logs/griffin_gaussian_p1_v45_scratch50/latest.pth'
+
+    vehicle:
+      modalities: ["cam"]
+      cam:
+        grid_conf:
+          xbound: [-51.2, 51.2, 0.4]
+          ybound: [-51.2, 51.2, 0.4]
+          zbound: [-5.0, 3.0, 8.0]
+          ddiscr: [0, 50, 50]
+          mode: 'LID'
+        data_aug_conf:
+          final_dim: [360, 640]
+        img_downsample: 8
+        img_features: 64
+        bevout_feature: 64
+        camera_encoder: EfficientNet
+        use_depth_gt: false
+        depth_supervision: false
+
+    # Kept only because the shared AirV2X image-stack constructor still
+    # instantiates all three agent modules. No RSU sample is ever provided.
+    rsu:
+      modalities: ["cam"]
+      cam:
+        grid_conf:
+          xbound: [-51.2, 51.2, 0.4]
+          ybound: [-51.2, 51.2, 0.4]
+          zbound: [-5.0, 3.0, 8.0]
+          ddiscr: [0, 50, 50]
+          mode: 'LID'
+        data_aug_conf:
+          final_dim: [360, 640]
+        img_downsample: 8
+        img_features: 64
+        bevout_feature: 64
+        camera_encoder: EfficientNet
+        use_depth_gt: false
+        depth_supervision: false
+
+    drone:
+      modalities: ["cam"]
+      cam:
+        grid_conf:
+          xbound: [-51.2, 51.2, 0.4]
+          ybound: [-51.2, 51.2, 0.4]
+          zbound: [-65.0, -50.0, 15.0]
+          # Unused for Griffin ideal-ground drone depth, but required by CamEncode.
+          ddiscr: [6, 150, 144]
+          mode: 'UD'
+        data_aug_conf:
+          final_dim: [360, 640]
+        img_downsample: 8
+        img_features: 64
+        bevout_feature: 64
+        camera_encoder: EfficientNet
+        use_depth_gt: false
+        depth_supervision: false
+
+    modality_fusion:
+      base_bev_backbone:
+        layer_nums: [3, 5, 8]
+        layer_strides: [2, 2, 2]
+        num_filters: [64, 128, 256]
+        upsample_strides: [1, 2, 4]
+        num_upsample_filter: [128, 128, 128]
+      shrink_header:
+        use: true
+        input_dim: 384
+        dim: [&out_channels 256]
+        kernal_size: [1]
+        stride: [1]
+        padding: [0]
+      compression: 0
+
+    task: *task
+    outC: *out_channels
+    anchor_number: *num_anchor
+    num_class: *num_class
+    cav_range: *cav_lidar
+    obj_head: true
+    obj_prior_prob: 0.01
+
+    gaussian_range_filter:
+      enabled: true
+
+    gaussian_refinement:
+      enabled: true
+      geometry:
+        input_dim: 10
+        geo_dim: 64
+      fusion:
+        hidden_dim: 256
+      agents:
+        vehicle:
+          unit_xyz: [2.0, 2.0, 1.0]
+        rsu:
+          unit_xyz: [2.0, 2.0, 1.0]
+        drone:
+          unit_xyz: [1.0, 1.0, 1.0]
+      scale:
+        delta_range: [-0.20, 0.05]
+      rotation:
+        max_angle: 0.2
+
+    gaussian_attention:
+      heads: 4
+      ffn_dim: 256
+      stage1_layers: 2
+      stage2_layers: 2
+      stage3_self_layers: 1
+      stage3_cross_layers: 1
+
+    gaussian_stage3:
+      voxel_size: [0.4, 0.4, 0.125]
+      point_cloud_range: *cav_lidar
+      adapter_bottleneck: 64
+      bev_n_sigma: 3.0
+
+##################
+# Loss Functions #
+##################
+loss:
+  det:
+    core_method: point_pillar_loss_multiclass
+    args:
+      cls_weight: 1.0
+      alpha: 0.25
+      gamma: 2.0
+      obj_weight: 2.0
+      iou_weight: 0.5
+      reg: 2.0
+      num_class: *num_class
+
+###########
+# Learner #
+###########
+optimizer:
+  core_method: Adam
+  lr: 0.002
+  args:
+    eps: 1.0e-10
+    weight_decay: 1.0e-4
+
+lr_scheduler:
+  core_method: multistep
+  gamma: 0.1
+  step_size: [10, 25, 40]
