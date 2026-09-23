@@ -24,22 +24,22 @@ train_params:
 ###########
 # Dataset #
 ###########
-root_dir: '/mnt/disk_4/suyi/Griffin/datasets/griffin_50scenes_55m/griffin-release'
-validate_dir: '/mnt/disk_4/suyi/Griffin/datasets/griffin_50scenes_55m/griffin-release'
-test_dir: '/mnt/disk_4/suyi/Griffin/datasets/griffin_50scenes_55m/griffin-release'
+root_dir: '/mnt/home/suyi/Griffin/datasets/griffin_50scenes_55m/griffin-release'
+validate_dir: '/mnt/home/suyi/Griffin/datasets/griffin_50scenes_55m/griffin-release'
+test_dir: '/mnt/home/suyi/Griffin/datasets/griffin_50scenes_55m/griffin-release'
 
 griffin:
-  split_json: '/mnt/disk_4/suyi/Griffin/data/split_datas/griffin_50scenes_55m.json'
+  split_json: '/mnt/home/suyi/Griffin/data/split_datas/griffin_50scenes_55m.json'
   final_dim: [360, 640]
+  image_scale: 0.5
   drone_stride: 4
   ground_z: 0.0
   max_ideal_depth: 150.0
-  photometric_distortion: true
-  seed: 20260923
+  photometric_distortion: false
 
 # background + {car, bicycle, pedestrian}
 num_class: &num_class 4
-num_anchor: &num_anchor 2
+num_anchor: &num_anchor 6
 task: &task "det"
 
 fusion:
@@ -66,9 +66,9 @@ postprocess:
   ego_type: *ego_type
   anchor_args:
     cav_lidar_range: *cav_lidar
-    l: 3.9
-    w: 1.6
-    h: 1.56
+    # Filled once from Griffin TRAIN labels as [h,w,l,z] medians for
+    # car / bicycle / pedestrian. With two rotations this gives 6 anchors.
+    sizes: auto_griffin_train_median
     r: [0, 90]
     feature_stride: 2
     num: *num_anchor
@@ -104,8 +104,8 @@ model:
     heatmap_num_classes: 2
     vehicle_p1_v45: true
     drone_depth_mode: ideal_ground
-    pretrained: '/mnt/home/suyi/AirV2X-Perception_gaussian/opencood/logs/griffin_gaussian_p1_v45_scratch50/latest.pth'
-    pretrained_v45: '/mnt/home/suyi/AirV2X-Perception_gaussian/opencood/logs/griffin_gaussian_p1_v45_scratch50/latest.pth'
+    pretrained: '/mnt/home/suyi/AirV2X-Perception_gaussian/opencood/logs/griffin_gaussian_p1_v45_scratch50_aug/best.pth'
+    pretrained_v45: '/mnt/home/suyi/AirV2X-Perception_gaussian/opencood/logs/griffin_gaussian_p1_v45_scratch50_aug/best.pth'
 
     vehicle:
       modalities: ["cam"]
