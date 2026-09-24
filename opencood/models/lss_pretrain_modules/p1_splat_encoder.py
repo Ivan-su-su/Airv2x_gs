@@ -57,7 +57,9 @@ class P1SplatEncoder(nn.Module):
         self.register_buffer("bx", bx.clone().detach(), persistent=False)
         self.register_buffer("nx", nx.clone().detach(), persistent=False)
 
-        self.frustum = self.create_frustum()
+        self.register_buffer(
+            "frustum", self.create_frustum(), persistent=False
+        )
         self.D = int(self.frustum.shape[0])
         self.bevencode = BevEncode(inC=self.camC, outC=self.bevout_feature)
         self.use_quickcumsum = True
@@ -179,15 +181,24 @@ class P1SplatEncoder(nn.Module):
                     f"expected {(batch_size, num_cam, feat_h, feat_w)}"
                 )
             z_map = z_map.to(device=f90.device, dtype=f90.dtype)
+            valid_depth = torch.isfinite(z_map) & (z_map > 0.0)
+            # Invalid bottom-camera rays must contribute neither geometry nor
+            # features. A large finite z keeps the inherited integer voxel
+            # conversion deterministic and guarantees range rejection.
+            z_safe = torch.where(
+                valid_depth, z_map, torch.full_like(z_map, 1.0e6)
+            )
             geom = self.get_geometry_from_z(
                 cam["rots"],
                 cam["trans"],
                 cam["intrinsics"],
                 cam["post_rots"],
                 cam["post_trans"],
-                z_map,
+                z_safe,
             )
-            x_img = feat
+            x_img = feat * valid_depth[:, :, None, :, :, None].to(
+                dtype=feat.dtype
+            )
         else:
             depth = pack.get("depth")
             if not torch.is_tensor(depth):
