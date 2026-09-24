@@ -9,6 +9,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from opencood.models.common_modules.torch_transformation_utils import warp_affine_simple
+
 
 # from opencood.models.fuse_modules.self_attn import ScaledDotProductAttention
 class ScaledDotProductAttention(nn.Module):
@@ -168,6 +170,7 @@ class Where2comm(nn.Module):
         super(Where2comm, self).__init__()
         self.discrete_ratio = args["voxel_size"][0]
         self.downsample_rate = args["downsample_rate"]
+        self.align_before_fusion = bool(args.get("align_before_fusion", False))
 
         self.fully = args["fully"]
         if self.fully:
@@ -210,6 +213,23 @@ class Where2comm(nn.Module):
         _, C, H, W = x.shape
         B = pairwise_t_matrix.shape[0]
 
+        if self.align_before_fusion:
+            pairwise_t_matrix = pairwise_t_matrix[:, :, :, [0, 1], :][
+                :, :, :, :, [0, 1, 3]
+            ]
+            pairwise_t_matrix[..., 0, 1] *= H / W
+            pairwise_t_matrix[..., 1, 0] *= W / H
+            pairwise_t_matrix[..., 0, 2] = (
+                pairwise_t_matrix[..., 0, 2]
+                / (self.downsample_rate * self.discrete_ratio * W)
+                * 2
+            )
+            pairwise_t_matrix[..., 1, 2] = (
+                pairwise_t_matrix[..., 1, 2]
+                / (self.downsample_rate * self.discrete_ratio * H)
+                * 2
+            )
+
         if self.multi_scale:
             ups = []
 
@@ -245,6 +265,15 @@ class Where2comm(nn.Module):
                 x_fuse = []
                 for b in range(B):
                     neighbor_feature = batch_node_features[b]
+                    if self.align_before_fusion:
+                        n_cav = int(record_len[b].item())
+                        t_matrix = pairwise_t_matrix[b][:n_cav, :n_cav]
+                        _, _, level_h, level_w = neighbor_feature.shape
+                        neighbor_feature = warp_affine_simple(
+                            neighbor_feature,
+                            t_matrix[0, :n_cav],
+                            (level_h, level_w),
+                        )
                     x_fuse.append(self.fuse_modules[i](neighbor_feature))
                 x_fuse = torch.stack(x_fuse)
 
@@ -282,6 +311,14 @@ class Where2comm(nn.Module):
             x_fuse = []
             for b in range(B):
                 neighbor_feature = batch_node_features[b]
+                if self.align_before_fusion:
+                    n_cav = int(record_len[b].item())
+                    t_matrix = pairwise_t_matrix[b][:n_cav, :n_cav]
+                    neighbor_feature = warp_affine_simple(
+                        neighbor_feature,
+                        t_matrix[0, :n_cav],
+                        (H, W),
+                    )
                 x_fuse.append(self.fuse_modules(neighbor_feature))
             x_fuse = torch.stack(x_fuse)
         return x_fuse, communication_rates
