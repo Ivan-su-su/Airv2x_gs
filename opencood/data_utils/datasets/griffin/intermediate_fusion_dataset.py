@@ -271,6 +271,14 @@ class IntermediateFusionDatasetGriffin(Dataset):
         }
 
     @staticmethod
+    def _batch_cam_inputs(cam_inputs: Dict[str, Any]) -> Dict[str, Any]:
+        """Add one agent-batch dimension; keep string metadata unchanged."""
+        return {
+            key: (value.unsqueeze(0) if torch.is_tensor(value) else value)
+            for key, value in cam_inputs.items()
+        }
+
+    @staticmethod
     def _read_label_rows(path: Path) -> List[List[str]]:
         if not path.exists():
             return []
@@ -443,9 +451,24 @@ class IntermediateFusionDatasetGriffin(Dataset):
     def collate_batch_train(self, batch: List[Dict[str, Any]]) -> Dict[str, Any]:
         if len(batch) != 1:
             raise ValueError(
-                "Griffin full Gaussian currently requires batch_size=1 per GPU."
+                "Griffin cooperative camera training currently requires "
+                "batch_size=1 per GPU."
             )
         sample = batch[0]["ego"]
+        pairwise = torch.from_numpy(
+            sample["img_pairwise_t_matrix_collab"]
+        ).float()
+
+        # V2X-ViT STTF uses target->source transforms. For ego=vehicle:
+        # [vehicle->vehicle, vehicle->drone] is exactly pairwise[0].
+        spatial_correction = pairwise[0].unsqueeze(0)
+
+        # [velocity, time_delay, infra]. Griffin pair is synchronized.
+        prior_encoding = torch.tensor(
+            [[[0.0, 0.0, 0.0], [0.0, 0.0, 1.0]]],
+            dtype=torch.float32,
+        )
+
         return {
             "ego": {
                 "frame_id": [sample["frame_id"]],
@@ -464,21 +487,31 @@ class IntermediateFusionDatasetGriffin(Dataset):
                     np.asarray(self.anchor_box)
                 ).float(),
                 "transformation_matrix": torch.eye(4, dtype=torch.float32),
-                "img_pairwise_t_matrix_collab": torch.from_numpy(
-                    sample["img_pairwise_t_matrix_collab"]
-                ).float().unsqueeze(0),
+                "pairwise_t_matrix_collab": pairwise.unsqueeze(0),
+                "img_pairwise_t_matrix_collab": pairwise.unsqueeze(0),
+                "spatial_correction_matrix": spatial_correction,
+                "prior_encoding": prior_encoding,
                 "agent_order": ["vehicle", "drone"],
                 "record_len": torch.tensor([2], dtype=torch.int64),
                 "vehicle": {
-                    "batch_merged_cam_inputs": sample["vehicle"]["cam_inputs"],
+                    "batch_merged_cam_inputs": self._batch_cam_inputs(
+                        sample["vehicle"]["cam_inputs"]
+                    ),
                     "record_len": torch.tensor([1], dtype=torch.int64),
-                    "batch_idxs": torch.tensor([0], dtype=torch.int64),
+                    "batch_idxs": [0],
+                },
+                "rsu": {
+                    "batch_merged_cam_inputs": {},
+                    "record_len": torch.tensor([0], dtype=torch.int64),
+                    "batch_idxs": [],
                 },
                 "drone": {
-                    "batch_merged_cam_inputs": sample["drone"]["cam_inputs"],
-                    "ideal_depth_z": sample["drone"]["ideal_depth_z"],
+                    "batch_merged_cam_inputs": self._batch_cam_inputs(
+                        sample["drone"]["cam_inputs"]
+                    ),
+                    "ideal_depth_z": sample["drone"]["ideal_depth_z"].unsqueeze(0),
                     "record_len": torch.tensor([1], dtype=torch.int64),
-                    "batch_idxs": torch.tensor([0], dtype=torch.int64),
+                    "batch_idxs": [0],
                 },
             }
         }
