@@ -12,11 +12,12 @@ from opencood.models.common_modules.downsample_conv import DownsampleConv
 from opencood.models.common_modules.naive_compress import NaiveCompressor
 from opencood.models.common_modules.airv2x_encoder import LiftSplatShootEncoder
 from opencood.models.common_modules.airv2x_base_model import Airv2xBase
+from opencood.models.lss_pretrain_modules.p1_mixin import P1CamMixin
 from opencood.models.where2comm_modules.where2comm_fuse import Where2comm
 from opencood.models.task_heads.segmentation_head import BevSegHead 
 
 
-class Airv2xWhere2com(Airv2xBase):
+class Airv2xWhere2com(P1CamMixin, Airv2xBase):
     def __init__(self, args):
         super().__init__(args)
 
@@ -35,7 +36,10 @@ class Airv2xWhere2com(Airv2xBase):
         # if "drone" in self.collaborators:
         #     self.drone_model = LiftSplatShootEncoder(args, agent_type="drone")
         
-        self.init_encoders(args)
+        if args.get("p1_checkpoint"):
+            P1CamMixin.init_encoders(self, args)
+        else:
+            Airv2xBase.init_encoders(self, args)
 
         modality_args = args["modality_fusion"]
         self.backbone = BaseBEVBackbone(modality_args["base_bev_backbone"], 64)
@@ -82,13 +86,13 @@ class Airv2xWhere2com(Airv2xBase):
         Fix the parameters of backbone during finetune on timedelay。
         """
         if "vehicle" in self.collaborators:
-            for p in self.veh_model.parameters():
+            for p in self.veh_models.parameters():
                 p.requires_grad = False
         if "rsu" in self.collaborators:
-            for p in self.rsu_model.parameters():
+            for p in self.rsu_models.parameters():
                 p.requires_grad = False
         if "drone" in self.collaborators:
-            for p in self.drone_model.parameters():
+            for p in self.drone_models.parameters():
                 p.requires_grad = False
 
         for p in self.backbone.parameters():
@@ -116,36 +120,23 @@ class Airv2xWhere2com(Airv2xBase):
 
     def forward(self, data_dict):
         batch_output_dict, batch_record_len = self.extract_features(data_dict)
-        batch_output_dict = self.backbone(batch_output_dict)
-
         batch_spatial_features = batch_output_dict["spatial_features"]
         comm_rates = batch_spatial_features.count_nonzero().item()
 
+        # One explicit backbone pass for the single-agent confidence map.
         batch_dict = self.backbone(batch_output_dict)
-        # N, C, H', W'. [N, 256, 50, 176]
         batch_spatial_features_2d = batch_dict["spatial_features_2d"]
-        print(f"[Where2comm] Backbone输出特征图尺寸: {batch_spatial_features_2d.shape}")
-        # camera features are still in its own coordinate system
         pairwise_t_matrix = data_dict["img_pairwise_t_matrix_collab"]
 
-        # downsample feature to reduce memory
         if self.shrink_flag:
-            batch_spatial_features_2d = self.shrink_conv(batch_spatial_features_2d)
-            print(f"[Where2comm] Shrink后特征图尺寸: {batch_spatial_features_2d.shape}")
-            
-        
-            
-        # import pdb; pdb.set_trace()
-        feat = batch_spatial_features_2d[0].mean(0).detach().cpu().numpy()
-        import cv2; import numpy as np
-        cv2.imwrite("debug/debug_image_bevfeat.png", ((feat - feat.min()) / (feat.max() - feat.min()) * 255).astype(np.uint8),)
-        
+            batch_spatial_features_2d = self.shrink_conv(
+                batch_spatial_features_2d
+            )
 
         output_dict = {}
         if self.args["task"] == "det":
-            # determine where2comm
-            psm = self.cls_head(batch_spatial_features_2d)
-            # compressor
+            psm_single = self.cls_head(batch_spatial_features_2d)
+
             if self.compression:
                 batch_spatial_features_2d = self.naive_compressor(
                     batch_spatial_features_2d
@@ -154,41 +145,40 @@ class Airv2xWhere2com(Airv2xBase):
             if self.multi_scale:
                 fused_feature, communication_rates = self.fusion_net(
                     batch_dict["spatial_features"],
-                    psm,
+                    psm_single,
                     batch_record_len,
                     pairwise_t_matrix,
                     self.backbone,
                 )
-
                 if self.shrink_flag:
                     fused_feature = self.shrink_conv(fused_feature)
             else:
                 fused_feature, communication_rates = self.fusion_net(
-                    batch_spatial_features_2d, psm, batch_record_len, pairwise_t_matrix
+                    batch_spatial_features_2d,
+                    psm_single,
+                    batch_record_len,
+                    pairwise_t_matrix,
                 )
 
-            psm = self.cls_head(fused_feature)
-            rm = self.reg_head(fused_feature)
-            print(f"[Where2comm] 检测头输出尺寸: psm={psm.shape}, rm={rm.shape}")
-
-            output_dict.update({"psm": psm, "rm": rm})
-
+            output_dict["psm"] = self.cls_head(fused_feature)
+            output_dict["rm"] = self.reg_head(fused_feature)
             if self.args["obj_head"]:
-                obj = self.obj_head(fused_feature)
-                print(f"[Where2comm] obj_head输出尺寸: obj={obj.shape}")
-                output_dict.update({"obj": obj})
-
+                output_dict["obj"] = self.obj_head(fused_feature)
             output_dict.update(
-                {"mask": 0, "com": communication_rates, "comm_rate": comm_rates}
+                {
+                    "mask": 0,
+                    "com": communication_rates,
+                    "comm_rate": comm_rates,
+                }
             )
+            return output_dict
 
-        elif self.args["task"] == "seg":
+        if self.args["task"] == "seg":
             _, ori_x = self.seg_head(batch_spatial_features_2d, True)
             if self.compression:
                 batch_spatial_features_2d = self.naive_compressor(
                     batch_spatial_features_2d
                 )
-
             if self.multi_scale:
                 fused_feature, communication_rates = self.fusion_net(
                     batch_dict["spatial_features"],
@@ -197,7 +187,6 @@ class Airv2xWhere2com(Airv2xBase):
                     pairwise_t_matrix,
                     self.backbone,
                 )
-
                 if self.shrink_flag:
                     fused_feature = self.shrink_conv(fused_feature)
             else:
@@ -207,25 +196,15 @@ class Airv2xWhere2com(Airv2xBase):
                     batch_record_len,
                     pairwise_t_matrix,
                 )
-            # seg_logits = self.seg_head(fused_feature)
-            # import cv2
-            # import numpy as np
-            # dynamic = data_dict['label_dict']['dynamic_seg_label'][0]
-            # dynamic = dynamic.detach().cpu().numpy()
-            # cv2.imwrite("/home/xiangbog/Folder/Research/airv2x/debug/debug_image_dynamic.png", ((dynamic - dynamic.min()) / (dynamic.max() - dynamic.min()) * 255).astype(np.uint8),)
-            # # output_dict.update({"seg_logits": seg_logits})
-            seg_output_dict = self.seg_head(fused_feature)
-            # feat = seg_output_dict['dynamic_seg'][0]
-            # feat = feat.mean(0).detach().cpu().numpy()
-            # cv2.imwrite("/home/xiangbog/Folder/Research/airv2x/debug/debug_image_segfeat.png", ((feat - feat.min()) / (feat.max() - feat.min()) * 255).astype(np.uint8),)
-            
-            # feat = batch_spatial_features_2d[0].mean(0).detach().cpu().numpy()
-            # import cv2; import numpy as np
-            # cv2.imwrite("/home/xiangbog/Folder/Research/airv2x/debug/debug_image_bevfeat.png", ((feat - feat.min()) / (feat.max() - feat.min()) * 255).astype(np.uint8),)
-        
-            # import pdb; pdb.set_trace()
-            output_dict.update(seg_output_dict)
+            output_dict.update(self.seg_head(fused_feature))
             output_dict.update(
-                {"mask": 0, "com": communication_rates, "comm_rate": comm_rates}
+                {
+                    "mask": 0,
+                    "com": communication_rates,
+                    "comm_rate": comm_rates,
+                }
             )
-        return output_dict
+            return output_dict
+
+        raise ValueError(f"Unsupported task: {self.args['task']}")
+
