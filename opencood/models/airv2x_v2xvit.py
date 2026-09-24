@@ -9,6 +9,7 @@ from opencood.models.common_modules.downsample_conv import DownsampleConv
 from opencood.models.common_modules.fuse_utils import regroup
 from opencood.models.common_modules.naive_compress import NaiveCompressor
 from opencood.models.common_modules.airv2x_base_model import Airv2xBase
+from opencood.models.lss_pretrain_modules.p1_mixin import P1CamMixin
 from opencood.models.common_modules.airv2x_encoder import LiftSplatShootEncoder
 from opencood.models.common_modules.point_pillar_scatter import PointPillarScatter
 from opencood.models.common_modules.airv2x_pillar_vfe import PillarVFE
@@ -16,7 +17,7 @@ from opencood.models.v2xvit_modules.v2xvit_basic import V2XTransformer
 from opencood.models.task_heads.segmentation_head import BevSegHead 
 
 
-class Airv2xV2XVit(Airv2xBase):
+class Airv2xV2XVit(P1CamMixin, Airv2xBase):
     def __init__(self, args):
         super().__init__(args)
 
@@ -27,7 +28,10 @@ class Airv2xV2XVit(Airv2xBase):
         self.active_sensors = args["active_sensors"]
         max_cav = args["max_cav"]
         self.max_cav_num = sum(max_cav.values())
-        self.init_encoders(args)
+        if args.get("p1_checkpoint"):
+            P1CamMixin.init_encoders(self, args)
+        else:
+            Airv2xBase.init_encoders(self, args)
 
         modality_args = args["modality_fusion"]
         self.backbone = BaseBEVBackbone(modality_args["base_bev_backbone"], 64)
