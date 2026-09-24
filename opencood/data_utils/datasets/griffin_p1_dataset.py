@@ -249,75 +249,17 @@ def resolve_split_frames(
     return frames
 
 
-<<<<<<< HEAD
-def photometric_distortion_bgr(img: np.ndarray, rng: np.random.RandomState) -> np.ndarray:
-    """Dependency-light replica of Griffin's PhotoMetricDistortionMultiViewImage.
-
-    The official transform applies each operation with p=0.5 and chooses
-    contrast either before or after HSV jitter. Input/output are BGR float32
-    in approximately [0,255].
-    """
-    out = img.astype(np.float32, copy=True)
-
-    if rng.randint(2):
-        out += rng.uniform(-32.0, 32.0)
-
-    mode = int(rng.randint(2))
-    if mode == 1 and rng.randint(2):
-        out *= rng.uniform(0.5, 1.5)
-
-    # OpenCV float HSV expects RGB/BGR values in [0,1] for stable S/V ranges.
-    tmp = np.clip(out / 255.0, 0.0, 1.0)
-    hsv = cv2.cvtColor(tmp, cv2.COLOR_BGR2HSV)
-    if rng.randint(2):
-        hsv[..., 1] *= rng.uniform(0.5, 1.5)
-    if rng.randint(2):
-        hsv[..., 0] += rng.uniform(-18.0, 18.0)
-        hsv[..., 0] = np.mod(hsv[..., 0], 360.0)
-    hsv[..., 1:] = np.clip(hsv[..., 1:], 0.0, 1.0)
-    out = cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR) * 255.0
-
-    if mode == 0 and rng.randint(2):
-        out *= rng.uniform(0.5, 1.5)
-
-    if rng.randint(2):
-        out = out[..., rng.permutation(3)]
-
-    return np.clip(out, 0.0, 255.0).astype(np.float32)
-
-
-def _bgr_to_normalized_tensor(
-    bgr: np.ndarray,
-    final_hw: Tuple[int, int],
-    image_scale: float,
-) -> torch.Tensor:
-    """Match Griffin P1 preprocessing exactly: scale first, then final resize."""
-    scale = float(image_scale)
-    if scale <= 0.0:
-        raise ValueError(f"image_scale must be > 0, got {scale}")
-    work = bgr
-    if abs(scale - 1.0) > 1.0e-8:
-        src_h, src_w = int(bgr.shape[0]), int(bgr.shape[1])
-        scaled_w = max(1, int(round(src_w * scale)))
-        scaled_h = max(1, int(round(src_h * scale)))
-        work = cv2.resize(
-            bgr, (scaled_w, scaled_h), interpolation=cv2.INTER_LINEAR
-        )
-    final_h, final_w = int(final_hw[0]), int(final_hw[1])
-    resized = cv2.resize(
-        work, (final_w, final_h), interpolation=cv2.INTER_LINEAR
-    )
-    rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
-=======
 def _scale_bgr_to_final(
     bgr: np.ndarray,
     final_hw: Tuple[int, int],
     image_scale: float,
 ) -> np.ndarray:
-    """Griffin ``RandomScaleImageMultiViewImage(scales=[0.5])`` then resize to P1 ``final_dim``."""
+    """Griffin scale-first preprocessing, then resize to P1 final_dim."""
     orig_h, orig_w = int(bgr.shape[0]), int(bgr.shape[1])
     final_h, final_w = int(final_hw[0]), int(final_hw[1])
     scale = float(image_scale)
+    if scale <= 0.0:
+        raise ValueError(f"image_scale must be > 0, got {scale}")
     mid_w = max(1, int(round(orig_w * scale)))
     mid_h = max(1, int(round(orig_h * scale)))
     mid = cv2.resize(bgr, (mid_w, mid_h), interpolation=cv2.INTER_LINEAR)
@@ -329,20 +271,33 @@ def _scale_mask_to_final(
     final_hw: Tuple[int, int],
     image_scale: float,
 ) -> np.ndarray:
-    """NEAREST scale for instance masks, same geometry as ``_scale_bgr_to_final``."""
+    """NEAREST scale for instance masks with the same two-stage geometry."""
     orig_h, orig_w = int(fg.shape[0]), int(fg.shape[1])
     final_h, final_w = int(final_hw[0]), int(final_hw[1])
     scale = float(image_scale)
+    if scale <= 0.0:
+        raise ValueError(f"image_scale must be > 0, got {scale}")
     mid_w = max(1, int(round(orig_w * scale)))
     mid_h = max(1, int(round(orig_h * scale)))
-    mid = cv2.resize(fg.astype(np.uint8), (mid_w, mid_h), interpolation=cv2.INTER_NEAREST)
-    return cv2.resize(mid, (final_w, final_h), interpolation=cv2.INTER_NEAREST).astype(bool)
+    mid = cv2.resize(
+        fg.astype(np.uint8),
+        (mid_w, mid_h),
+        interpolation=cv2.INTER_NEAREST,
+    )
+    return cv2.resize(
+        mid,
+        (final_w, final_h),
+        interpolation=cv2.INTER_NEAREST,
+    ).astype(bool)
 
 
-def _bgr_to_normalized_tensor(bgr: np.ndarray, final_hw: Tuple[int, int], image_scale: float) -> torch.Tensor:
+def _bgr_to_normalized_tensor(
+    bgr: np.ndarray,
+    final_hw: Tuple[int, int],
+    image_scale: float,
+) -> torch.Tensor:
     scaled = _scale_bgr_to_final(bgr, final_hw, image_scale)
     rgb = cv2.cvtColor(scaled, cv2.COLOR_BGR2RGB)
->>>>>>> 9686219 (WIP: local Griffin geometry and P1 changes)
     tensor = torch.from_numpy(rgb).permute(2, 0, 1).contiguous().float() / 255.0
     return imagenet_normalize_display_rgb(tensor)
 
@@ -632,7 +587,9 @@ class GriffinP1Dataset(Dataset):
         self.vehicle_root = self.root / "vehicle-side"
         self.drone_root = self.root / "drone-side"
         self.final_hw = tuple(int(x) for x in self.cfg.get("final_dim", [360, 640]))
-        self.image_scale = float(self.cfg.get("image_scale", 0.5))
+        self.image_scale = float(
+            self.cfg.get("image_scale", self.cfg.get("griffin_image_scale", 0.5))
+        )
         self.vehicle_stride = int(self.cfg.get("vehicle_stride", 8))
         self.drone_stride = int(self.cfg.get("drone_stride", 4))
         self.lidar_num_features = int(self.cfg.get("lidar_num_features", 4))
@@ -647,7 +604,6 @@ class GriffinP1Dataset(Dataset):
         )
         self.max_mask_fg_ratio = float(self.cfg.get("max_mask_foreground_ratio", 0.98))
         self.seed = int(self.cfg.get("seed", 20260918))
-        self.image_scale = float(self.cfg.get("griffin_image_scale", 0.5))
         self.val_frame_train_fraction = float(
             self.cfg.get("val_frame_train_fraction", 0.0)
         )
@@ -684,14 +640,9 @@ class GriffinP1Dataset(Dataset):
 
         print(
             f"[GriffinP1Dataset] split={self.split} frames={len(self.frames)} "
-<<<<<<< HEAD
             f"final={self.final_hw} image_scale={self.image_scale} "
-            f"veh_stride={self.vehicle_stride} drone_stride={self.drone_stride} "
-            f"photometric={self.photometric}"
-=======
-            f"final={self.final_hw} veh_stride={self.vehicle_stride} "
-            f"drone_stride={self.drone_stride} griffin_image_scale={self.image_scale}"
->>>>>>> 9686219 (WIP: local Griffin geometry and P1 changes)
+            f"veh_stride={self.vehicle_stride} "
+            f"drone_stride={self.drone_stride} photometric=False"
         )
 
     def _frame_complete(self, frame: str) -> bool:
@@ -708,16 +659,12 @@ class GriffinP1Dataset(Dataset):
     def __len__(self) -> int:
         return len(self.frames)
 
-    def _rng(self, index: int, view_offset: int) -> np.random.RandomState:
-        return np.random.RandomState(self.seed + index * 31 + view_offset * 1009)
-
     def _load_view(
         self,
         side_root: Path,
         cam: str,
         frame: str,
         stride: int,
-        rng: np.random.RandomState,
     ) -> Tuple[torch.Tensor, torch.Tensor, Tuple[int, int], np.ndarray, float]:
         rgb_path = side_root / "camera" / cam / f"{frame}.png"
         mask_path = side_root / "camera" / f"instance_{cam}" / f"{frame}.png"
@@ -726,14 +673,6 @@ class GriffinP1Dataset(Dataset):
         if bgr is None:
             raise FileNotFoundError(rgb_path)
         original_hw = (int(bgr.shape[0]), int(bgr.shape[1]))
-<<<<<<< HEAD
-        if self.photometric:
-            bgr = photometric_distortion_bgr(bgr.astype(np.float32), rng)
-        img_t = _bgr_to_normalized_tensor(
-            bgr, self.final_hw, self.image_scale
-        )
-=======
->>>>>>> 9686219 (WIP: local Griffin geometry and P1 changes)
 
         mask = cv2.imread(str(mask_path), cv2.IMREAD_UNCHANGED)
         if mask is None:
@@ -775,7 +714,6 @@ class GriffinP1Dataset(Dataset):
                 cam,
                 frame,
                 self.vehicle_stride,
-                self._rng(index, view_idx),
             )
             t_cam_to_ego, k_orig = self.vehicle_calib[cam]
             depth, valid = project_lidar_to_camera_cells(
@@ -804,7 +742,6 @@ class GriffinP1Dataset(Dataset):
                 cam,
                 frame,
                 self.drone_stride,
-                self._rng(index, 100 + view_idx),
             )
             drone_imgs.append(img_t)
             drone_hm.append(hm_t)

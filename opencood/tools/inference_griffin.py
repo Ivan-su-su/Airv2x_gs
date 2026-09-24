@@ -6,13 +6,22 @@ from __future__ import annotations
 import argparse
 import os
 from collections import defaultdict
+from pathlib import Path
 
+import numpy as np
 import torch
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 from tqdm import tqdm
 
 import opencood.hypes_yaml.yaml_utils as yaml_utils
 from opencood.data_utils.datasets import build_dataset
+from opencood.data_utils.datasets.griffin_p1_dataset import (
+    _load_scene_infos,
+    _match_split_scene,
+    _scene_frames,
+    _scene_name,
+    _split_scene_names,
+)
 from opencood.tools import train_utils
 from opencood.utils import eval_utils_airv2x as eval_utils
 
@@ -22,8 +31,43 @@ def parse_args():
     p.add_argument("--model_dir", required=True)
     p.add_argument("--eval_epoch", type=int, default=None)
     p.add_argument("--gpu", type=int, default=0)
-    p.add_argument("--workers", type=int, default=4)
+    p.add_argument("--workers", type=int, default=2)
+    p.add_argument(
+        "--per-scene",
+        type=int,
+        default=0,
+        help="If >0, evaluate this many uniformly spaced frames from each val scene.",
+    )
     return p.parse_args()
+
+
+def sample_val_indices(dataset, hypes, per_scene: int) -> list:
+    """Pick ``per_scene`` frames from each official Griffin val scene."""
+    frame_to_idx = {frame: i for i, frame in enumerate(dataset.frames)}
+    vehicle_root = Path(hypes["validate_dir"]) / "vehicle-side"
+    scenes = _load_scene_infos(vehicle_root)
+    val_names = _split_scene_names(Path(hypes["griffin"]["split_json"]), "val")
+    indices = []
+    for scene_name in val_names:
+        matched = None
+        for i, scene in enumerate(scenes):
+            if _match_split_scene(_scene_name(scene, i), scene_name):
+                matched = scene
+                break
+        if matched is None:
+            raise RuntimeError(f"val scene missing: {scene_name}")
+        frames = [f for f in _scene_frames(matched) if f in frame_to_idx]
+        if not frames:
+            raise RuntimeError(f"no usable frames for {scene_name}")
+        positions = np.linspace(0, len(frames) - 1, per_scene).round().astype(int)
+        picked = []
+        for pos in positions:
+            frame = frames[int(pos)]
+            if frame not in picked:
+                picked.append(frame)
+        indices.extend(frame_to_idx[frame] for frame in picked)
+        print(f"[sample] {scene_name} frames={picked}")
+    return indices
 
 
 def main():
@@ -35,8 +79,15 @@ def main():
 
     hypes = yaml_utils.load_yaml(None, Opt())
     dataset = build_dataset(hypes, visualize=False, train=False)
+    eval_set = dataset
+    tag = "full"
+    if args.per_scene > 0:
+        indices = sample_val_indices(dataset, hypes, args.per_scene)
+        eval_set = Subset(dataset, indices)
+        tag = f"sample{args.per_scene}"
+        print(f"[sample] total frames={len(indices)}")
     loader = DataLoader(
-        dataset,
+        eval_set,
         batch_size=1,
         num_workers=args.workers,
         collate_fn=dataset.collate_batch_test,
@@ -98,11 +149,13 @@ def main():
             global_sort_detections=True,
         )
         lines.append(
-            f"epoch={epoch_id} IoU={iou:.1f} "
+            f"epoch={epoch_id} split={tag} IoU={iou:.1f} "
             f"AP={ap_per_class} mAP={mean_ap:.4f}"
         )
 
-    out_path = os.path.join(args.model_dir, f"griffin_eval_epoch{epoch_id}.txt")
+    out_path = os.path.join(
+        args.model_dir, f"griffin_eval_epoch{epoch_id}_{tag}.txt"
+    )
     with open(out_path, "w") as handle:
         handle.write("\n".join(lines) + "\n")
     print("\n".join(lines))

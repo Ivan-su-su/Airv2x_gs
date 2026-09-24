@@ -760,8 +760,8 @@ class VoxelPostprocessor(BasePostprocessor):
             C = getattr(self.params, "num_class", C)
             A = AC // C
 
-            psm = psm.view(B, C, A, H, W)
-            psm = psm.permute(0, 3, 4, 2, 1).contiguous()  # [1, H, W, A, C]
+            # Loss lays channels out as anchor-major then class: (A, C).
+            psm = psm.permute(0, 2, 3, 1).contiguous().view(B, H, W, A, C)
             prob = torch.sigmoid(psm)
             prob = prob.view(1, -1, C)  # [1, H*W*A, C]]
             prob = prob[:, :, 1:]

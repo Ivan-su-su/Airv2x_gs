@@ -9,7 +9,7 @@ import torch
 
 from opencood.utils.common_utils import check_numpy_to_torch
 
-# from opencood.pcdet_utils.iou3d_nms import iou3d_nms_cuda
+from opencood.pcdet_utils.iou3d_nms import iou3d_nms_cuda
 
 
 def boxes_bev_iou_cpu(boxes_a, boxes_b):

@@ -1,0 +1,30 @@
+name: airv2x_gaussian_0822_geom_sup_opacity_feature
+inherit_from: opencood/hypes_yaml/airv2x/camera/det/airv2x_gaussian_0822_geom_sup_opacity.yaml
+yaml_parser: "load_airv2x_heter_params"
+
+model:
+  args:
+    gaussian_stage3:
+      opacity:
+        feature_conditioned: true
+
+        # Legacy-compatible switch controlling which feature is used
+        # for the second/final opacity estimation.
+        #
+        # "pooled":
+        #   legacy timing:
+        #   Stage2 -> alpha_pre -> weighted pool
+        #   -> alpha_final from pooled feature
+        #   -> Stage3 context -> splat
+        #
+        # "stage3":
+        #   new timing:
+        #   Stage2 -> alpha_pre -> weighted pool
+        #   -> Stage3 context
+        #   -> alpha_final from contextualized Stage3 feature
+        #   -> splat
+        final_opacity_source: "stage3"
+
+        feature_hidden_dim: 32
+        feature_embed_dim: 8
+        fusion_hidden_dim: 8

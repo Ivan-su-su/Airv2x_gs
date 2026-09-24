@@ -88,17 +88,35 @@ class GaussianContextInteraction(nn.Module):
         opacity = dict(opacity_cfg or {})
         self.opacity_enabled = bool(opacity.get("enabled", False))
         self.opacity_agent_specific = bool(opacity.get("agent_specific", True))
+        self.opacity_feature_conditioned = bool(
+            opacity.get("feature_conditioned", False)
+        )
+        self.final_opacity_source = str(
+            opacity.get("final_opacity_source", "pooled")
+        ).lower()
+        if self.final_opacity_source not in ("pooled", "stage3"):
+            raise ValueError(
+                "final_opacity_source must be 'pooled' or 'stage3', "
+                f"got {self.final_opacity_source!r}"
+            )
         self.opacity_heads = nn.ModuleDict()
         if self.opacity_enabled:
             agents = [str(a) for a in opacity.get("agents", ("vehicle", "rsu", "drone"))]
             keys = agents if self.opacity_agent_specific else ["shared"]
             for key in keys:
                 self.opacity_heads[key] = GaussianOpacityCalibrator(
+                    feature_dim=feature_dim,
                     hidden_dim=int(opacity.get("hidden_dim", 16)),
                     init_prob=float(opacity.get("init_prob", 0.95)),
                     detach_covariance=bool(opacity.get("detach_covariance", True)),
                     cell_x=float(voxel_size[0]),
                     cell_y=float(voxel_size[1]),
+                    feature_conditioned=bool(
+                        opacity.get("feature_conditioned", False)
+                    ),
+                    feature_hidden_dim=int(opacity.get("feature_hidden_dim", 32)),
+                    feature_embed_dim=int(opacity.get("feature_embed_dim", 8)),
+                    fusion_hidden_dim=int(opacity.get("fusion_hidden_dim", 8)),
                 )
         self.split_mlp = nn.Linear(feature_dim, 2 * feature_dim)
         self.self_blocks = nn.ModuleList(
@@ -146,8 +164,9 @@ class GaussianContextInteraction(nn.Module):
                     gs,
                     weights=alpha_pre,
                 )
-                alpha_final = self._calibrate_opacity(agent, pooled_gs)
-                pooled_gs = pooled_gs.replace_opacity(alpha_final)
+                if self.final_opacity_source == "pooled":
+                    alpha_final = self._calibrate_opacity(agent, pooled_gs)
+                    pooled_gs = pooled_gs.replace_opacity(alpha_final)
             else:
                 pooled_gs = self.pool(gs)
             pooled[agent] = pooled_gs
@@ -201,6 +220,16 @@ class GaussianContextInteraction(nn.Module):
         delta = self.fusion_mlp(fusion_input)
         fused = pooled_feature + delta
         out = merged.replace_feature(fused)
+        if self.opacity_enabled and self.final_opacity_source == "stage3":
+            final_opacity = out.feature.new_empty((out.n_gaussians,))
+            for agent, (start, end) in agent_slices.items():
+                if end <= start:
+                    continue
+                rows = torch.arange(start, end, device=out.feature.device)
+                agent_gs = out.index_select(rows)
+                alpha = self._calibrate_opacity(agent, agent_gs)
+                final_opacity[start:end] = alpha
+            out = out.replace_opacity(final_opacity)
         return out, self.splat(out)
 
     def _merge(

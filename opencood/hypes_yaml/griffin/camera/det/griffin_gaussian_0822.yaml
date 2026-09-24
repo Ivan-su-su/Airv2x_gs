@@ -223,6 +223,13 @@ model:
       point_cloud_range: *cav_lidar
       adapter_bottleneck: 64
       bev_n_sigma: 3.0
+      opacity:
+        enabled: true
+        hidden_dim: 16
+        init_prob: 0.95
+        detach_covariance: true
+        agent_specific: true
+        agents: ["vehicle", "drone"]
 
 ##################
 # Loss Functions #
@@ -235,6 +242,8 @@ loss:
       alpha: 0.25
       gamma: 2.0
       obj_weight: 2.0
+      obj_alpha: 0.5
+      obj_gamma: 2.0
       iou_weight: 0.5
       reg: 2.0
       num_class: *num_class

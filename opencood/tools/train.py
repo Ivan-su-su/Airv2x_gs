@@ -31,7 +31,9 @@ from torch.utils.data import DataLoader, DistributedSampler
 from tqdm import tqdm
 
 root_path = Path(__file__).resolve().parents[2]
-sys.path.append(str(root_path))
+# This env's easy-install.pth puts AirV2X-Perception_gs first. Append would
+# leave that copy winning, so Griffin dataset registration never loads.
+sys.path.insert(0, str(root_path))
 
 import opencood.hypes_yaml.yaml_utils as yaml_utils
 from opencood.data_utils.datasets import build_dataset
