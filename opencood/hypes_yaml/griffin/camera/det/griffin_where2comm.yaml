@@ -1,0 +1,198 @@
+name: griffin_where2comm_p1_camera
+
+active_sensors: &active_sensors ["cam"]
+collaborators: &collaborators ["vehicle", "drone"]
+ego_type: &ego_type vehicle
+yaml_parser: "load_voxel_params"
+
+train_params:
+  batch_size: 1
+  epoches: 50
+  eval_freq: 2
+  save_freq: 1
+  max_cav:
+    vehicle: 1
+    rsu: 0
+    drone: 1
+
+root_dir: '/mnt/home/suyi/Griffin/datasets/griffin_50scenes_55m/griffin-release'
+validate_dir: '/mnt/home/suyi/Griffin/datasets/griffin_50scenes_55m/griffin-release'
+test_dir: '/mnt/home/suyi/Griffin/datasets/griffin_50scenes_55m/griffin-release'
+
+griffin:
+  split_json: '/mnt/home/suyi/Griffin/data/split_datas/griffin_50scenes_55m.json'
+  final_dim: [360, 640]
+  image_scale: 0.5
+  drone_stride: 4
+  ground_z: 0.0
+  max_ideal_depth: 150.0
+  photometric_distortion: false
+
+num_class: &num_class 4
+num_anchor: &num_anchor 6
+task: &task "det"
+
+fusion:
+  core_method: 'IntermediateFusionDatasetGriffin'
+  args:
+    proj_first: true
+
+data_augment: []
+
+preprocess:
+  core_method: 'SpVoxelPreprocessor'
+  ego_type: *ego_type
+  args:
+    voxel_size: &voxel_size [0.4, 0.4, 8.0]
+    max_points_per_voxel: 32
+    max_voxel_train: 32000
+    max_voxel_test: 70000
+  cav_lidar_range: &cav_lidar [-51.2, -51.2, -5.0, 51.2, 51.2, 3.0]
+
+POINT_CLOUD_RANGE: *cav_lidar
+
+postprocess:
+  core_method: 'VoxelPostprocessor'
+  ego_type: *ego_type
+  anchor_args:
+    cav_lidar_range: *cav_lidar
+    sizes: auto_griffin_train_median
+    r: [0, 90]
+    feature_stride: 2
+    num: *num_anchor
+    num_class: *num_class
+  target_args:
+    pos_threshold: 0.60
+    neg_threshold: 0.45
+    score_threshold: 0.20
+    obj_threshold: 0.20
+  order: 'hwl'
+  max_num: 300
+  nms_thresh: 0.15
+
+model:
+  core_method: airv2x_where2com
+  args:
+    ego_type: *ego_type
+    collaborators: *collaborators
+    active_sensors: *active_sensors
+    max_cav:
+      vehicle: 1
+      rsu: 0
+      drone: 1
+    device: cuda
+    train: true
+    proj_first: true
+    supervise_single: false
+    backbone_fix: false
+
+    p1_checkpoint: '/mnt/home/suyi/AirV2X-Perception_gaussian/opencood/logs/griffin_gaussian_p1_v45_scratch50_aug/best.pth'
+
+    vehicle:
+      modalities: ["cam"]
+      cam:
+        grid_conf:
+          xbound: [-51.2, 51.2, 0.4]
+          ybound: [-51.2, 51.2, 0.4]
+          zbound: [-5.0, 3.0, 8.0]
+          ddiscr: [0, 50, 50]
+          mode: 'LID'
+        data_aug_conf:
+          final_dim: [360, 640]
+        img_downsample: 8
+        img_features: 64
+        bevout_feature: 64
+        camera_encoder: EfficientNet
+        use_depth_gt: false
+        depth_supervision: false
+        lift: categorical
+        feature_sample_mode: cell_center
+
+    rsu:
+      modalities: []
+
+    drone:
+      modalities: ["cam"]
+      cam:
+        grid_conf:
+          xbound: [-51.2, 51.2, 0.4]
+          ybound: [-51.2, 51.2, 0.4]
+          zbound: [-65.0, -50.0, 15.0]
+          ddiscr: [6, 150, 144]
+          mode: 'UD'
+        data_aug_conf:
+          final_dim: [360, 640]
+        img_downsample: 4
+        img_features: 64
+        bevout_feature: 64
+        camera_encoder: EfficientNet
+        use_depth_gt: false
+        depth_supervision: false
+        lift: ideal_ground
+        feature_sample_mode: cell_center
+
+    modality_fusion:
+      base_bev_backbone:
+        layer_nums: &layer_nums [3, 5, 8]
+        layer_strides: [2, 2, 2]
+        num_filters: &num_filters [64, 128, 256]
+        upsample_strides: [1, 2, 4]
+        num_upsample_filter: [128, 128, 128]
+      shrink_header:
+        use: true
+        input_dim: 384
+        dim: [&out_channels 256]
+        kernal_size: [1]
+        stride: [1]
+        padding: [0]
+      compression: 0
+
+    where2com_fusion:
+      fully: false
+      voxel_size: *voxel_size
+      # Pairwise normalization is done from the raw 256x256 local BEV.
+      downsample_rate: 1
+      in_channels: 256
+      multi_scale: true
+      align_before_fusion: true
+      layer_nums: *layer_nums
+      num_filters: *num_filters
+      communication:
+        round: 1
+        threshold: 0.01
+        gaussian_smooth:
+          k_size: 5
+          c_sigma: 1.0
+
+    task: *task
+    outC: *out_channels
+    anchor_number: *num_anchor
+    num_class: *num_class
+    cav_range: *cav_lidar
+    obj_head: true
+
+loss:
+  det:
+    core_method: point_pillar_loss_multiclass
+    args:
+      cls_weight: 1.0
+      alpha: 0.25
+      gamma: 2.0
+      obj_weight: 2.0
+      obj_alpha: 0.5
+      obj_gamma: 2.0
+      iou_weight: 0.5
+      reg: 2.0
+      num_class: *num_class
+
+optimizer:
+  core_method: Adam
+  lr: 0.002
+  args:
+    eps: 1.0e-10
+    weight_decay: 1.0e-4
+
+lr_scheduler:
+  core_method: multistep
+  gamma: 0.1
+  step_size: [10, 25, 40]
