@@ -1,7 +1,7 @@
-name: griffin_v2xvit_p1_camera_lr5e4
+name: griffin_homo_vehicle
 
 active_sensors: &active_sensors ["cam"]
-collaborators: &collaborators ["vehicle", "drone"]
+collaborators: &collaborators ["vehicle"]
 ego_type: &ego_type vehicle
 yaml_parser: "load_voxel_params"
 
@@ -13,7 +13,7 @@ train_params:
   max_cav:
     vehicle: 1
     rsu: 0
-    drone: 1
+    drone: 0
 
 root_dir: '/mnt/home/suyi/Griffin/datasets/griffin_50scenes_55m/griffin-release'
 validate_dir: '/mnt/home/suyi/Griffin/datasets/griffin_50scenes_55m/griffin-release'
@@ -33,7 +33,7 @@ num_anchor: &num_anchor 6
 task: &task "det"
 
 fusion:
-  core_method: 'IntermediateFusionDatasetGriffin'
+  core_method: 'GriffinHomoVehicleDataset'
   args:
     proj_first: true
 
@@ -71,23 +71,28 @@ postprocess:
   nms_thresh: 0.15
 
 model:
-  core_method: airv2x_v2xvit
+  core_method: griffin_homo_base
   args:
     ego_type: *ego_type
     collaborators: *collaborators
+    homo_agent_type: vehicle
     active_sensors: *active_sensors
     max_cav:
       vehicle: 1
       rsu: 0
-      drone: 1
+      drone: 0
     device: cuda
     train: true
     proj_first: true
     supervise_single: false
-    backbone_fix: false
 
-    # Same frozen Griffin P1 used by Gaussian0822. Heatmap weights are ignored.
+    # Frozen Griffin P1. Heatmap heads are not loaded.
+    # freeze_lss is forced off in GriffinHomoBase so BevEncode can train.
     p1_checkpoint: '/mnt/home/suyi/AirV2X-Perception_gaussian/opencood/logs/griffin_gaussian_p1_v45_scratch50_aug/best.pth'
+    freeze_lss: false
+    freeze_bev_backbone: false
+    freeze_fusion: false
+    freeze_heads: false
 
     vehicle:
       modalities: ["cam"]
@@ -109,78 +114,31 @@ model:
         lift: categorical
         feature_sample_mode: cell_center
 
-    rsu:
-      modalities: []
-
-    drone:
-      modalities: ["cam"]
-      cam:
-        grid_conf:
-          xbound: [-51.2, 51.2, 0.4]
-          ybound: [-51.2, 51.2, 0.4]
-          zbound: [-65.0, -50.0, 15.0]
-          ddiscr: [6, 150, 144]
-          mode: 'UD'
-        data_aug_conf:
-          final_dim: [360, 640]
-        img_downsample: 4
-        img_features: 64
-        bevout_feature: 64
-        camera_encoder: EfficientNet
-        use_depth_gt: false
-        depth_supervision: false
-        lift: ideal_ground
-        feature_sample_mode: cell_center
-
     modality_fusion:
       base_bev_backbone:
-        layer_nums: [3, 5, 8]
-        layer_strides: [2, 2, 2]
-        num_filters: [64, 128, 256]
-        upsample_strides: [1, 2, 4]
-        num_upsample_filter: [128, 128, 128]
+        layer_nums: [3]
+        layer_strides: [2]
+        num_filters: [64]
       shrink_header:
         use: true
         input_dim: 384
-        dim: [&out_channels 256]
+        dim: [256]
         kernal_size: [1]
         stride: [1]
         padding: [0]
       compression: 0
 
-    transformer:
-      encoder:
-        num_blocks: 1
-        depth: 3
-        use_roi_mask: true
-        use_RTE: &use_RTE true
-        RTE_ratio: &RTE_ratio 2
-        cav_att_config:
-          dim: 256
-          use_hetero: true
-          use_RTE: *use_RTE
-          RTE_ratio: *RTE_ratio
-          heads: 8
-          dim_head: 32
-          dropout: 0.3
-        pwindow_att_config:
-          dim: 256
-          heads: [16, 8, 4]
-          dim_head: [16, 32, 64]
-          dropout: 0.3
-          window_size: [2, 4, 4]
-          relative_pos_embedding: true
-          fusion_method: 'split_attn'
-        feed_forward:
-          mlp_dim: 256
-          dropout: 0.3
-        sttf:
-          voxel_size: *voxel_size
-          # P1 LSS BEV is 256x256; BaseBEVBackbone output is 128x128.
-          downsample_rate: 2
+    fusion_backbone:
+      resnext: true
+      layer_nums: [3, 5, 8]
+      layer_strides: [1, 2, 2]
+      num_filters: [64, 128, 256]
+      upsample_strides: [1, 2, 4]
+      num_upsample_filter: [128, 128, 128]
+      anchor_number: *num_anchor
 
     task: *task
-    outC: *out_channels
+    in_head: 256
     anchor_number: *num_anchor
     num_class: *num_class
     cav_range: *cav_lidar
@@ -202,18 +160,12 @@ loss:
 
 optimizer:
   core_method: Adam
-  # 0.002 blew up: epoch-0 grad-norm>20 on 64% of steps and val loss
-  # climbed 7.49 -> 15.8. 5e-4 matches the fusion-net sensitivity.
-  lr: 0.0005
+  lr: 0.002
   args:
     eps: 1.0e-10
     weight_decay: 1.0e-4
 
 lr_scheduler:
-  # Linear warmup over the first 2 epochs (1e-3 * lr -> lr), then the
-  # same multistep decays as the other Griffin camera baselines.
-  core_method: warmup_multistep
+  core_method: multistep
   gamma: 0.1
   step_size: [10, 25, 40]
-  warmup_epochs: 2
-  warmup_factor: 0.001

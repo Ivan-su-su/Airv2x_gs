@@ -10,7 +10,11 @@ import time
 
 root_path = os.path.abspath(__file__)
 root_path = "/".join(root_path.split("/")[:-3])
-sys.path.append(root_path)
+# easy-install.pth in this env puts AirV2X-Perception_gs / _copy earlier on
+# sys.path; appending here let that stale copy shadow this repo, so Griffin
+# homo datasets were missing at build_dataset time. Match train.py, which
+# inserts at 0 for the same reason.
+sys.path.insert(0, root_path)
 
 import numpy as np
 import torch

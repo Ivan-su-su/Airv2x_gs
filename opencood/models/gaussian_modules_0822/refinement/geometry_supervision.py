@@ -93,8 +93,15 @@ def compute_stage2_delta_mean_loss(
     cross_valid_by_agent: Mapping[str, torch.Tensor],
     depth_ranges: Mapping[str, Tuple[float, float]],
     beta: float = 1.0,
+    mean_update_mode: str = "xyz",
 ) -> torch.Tensor:
-    """Smooth-L1 on Stage-2 mean residual vs GT ego point, all valid coords.
+    """Smooth-L1 on Stage-2 mean residual vs GT ego point.
+
+    In ``"xyz"`` mode the 3-D residual is supervised directly and the
+    normalization counts 3 coordinates per Gaussian. In ``"ray"`` mode
+    both the predicted and GT residuals are projected onto the Stage-1
+    observation ray, giving a strict 1-DoF scalar supervision (1 count
+    per Gaussian).
 
     Args:
         stage1_gaussians_by_agent: Per-agent Stage-1 Gaussian sets.
@@ -103,10 +110,19 @@ def compute_stage2_delta_mean_loss(
         cross_valid_by_agent: Stage-2 cross-agent valid mask per query agent.
         depth_ranges: ``{agent: (d_min, d_max)}`` from LSS ``ddiscr``.
         beta: Smooth-L1 transition point.
+        mean_update_mode: ``"xyz"`` or ``"ray"``; must match the refiner.
 
     Returns:
         Scalar geometry loss, or a differentiable zero if nothing is valid.
+
+    Raises:
+        ValueError: Unknown mode, or ray mode without ``s1.ray_dir``.
     """
+    mode = str(mean_update_mode).lower()
+    if mode not in ("xyz", "ray"):
+        raise ValueError(
+            f"mean_update_mode must be 'xyz' or 'ray', got {mode!r}"
+        )
     loss_sum = _zero_like(stage2_gaussians_by_agent)
     num_coords = 0
     for agent, s2 in stage2_gaussians_by_agent.items():
@@ -148,10 +164,31 @@ def compute_stage2_delta_mean_loss(
         loss_idx = loss_mask.nonzero(as_tuple=False).squeeze(1)
         gt_xyz_ego = _gt_xyz_ego(s1, geometry, uv_px, view, gt_depth, loss_idx)
         base_mean = s1.mean.detach()[loss_idx]
-        delta_pred = s2.mean[loss_idx] - base_mean
-        delta_gt = gt_xyz_ego - base_mean
-        loss_sum = loss_sum + F.smooth_l1_loss(
-            delta_pred, delta_gt, beta=beta, reduction="sum"
-        )
-        num_coords += int(loss_idx.numel()) * 3
+        if mode == "xyz":
+            # Legacy 3-DoF supervision, kept identical.
+            delta_pred = s2.mean[loss_idx] - base_mean
+            delta_gt = gt_xyz_ego - base_mean
+            loss_sum = loss_sum + F.smooth_l1_loss(
+                delta_pred, delta_gt, beta=beta, reduction="sum"
+            )
+            num_coords += int(loss_idx.numel()) * 3
+        else:
+            if s1.ray_dir is None:
+                raise ValueError(
+                    "ray geometry supervision requires s1.ray_dir"
+                )
+            ray = s1.ray_dir[loss_idx].detach()
+            ray = ray / torch.linalg.norm(
+                ray, dim=-1, keepdim=True
+            ).clamp_min(1.0e-8)
+            # Project GT / predicted center displacement onto the ray:
+            # strict 1-DoF scalar residual supervision.
+            delta_gt_xyz = gt_xyz_ego - base_mean
+            delta_gt_ray = (delta_gt_xyz * ray).sum(dim=-1)
+            delta_pred_xyz = s2.mean[loss_idx] - base_mean
+            delta_pred_ray = (delta_pred_xyz * ray).sum(dim=-1)
+            loss_sum = loss_sum + F.smooth_l1_loss(
+                delta_pred_ray, delta_gt_ray, beta=beta, reduction="sum"
+            )
+            num_coords += int(loss_idx.numel())
     return loss_sum / max(num_coords, 1)

@@ -562,6 +562,19 @@ def setup_lr_schedular(hypes, optimizer, init_epoch=None, n_iter_per_epoch=None)
             cycle_limit=1,
             t_in_epochs=False,
         )
+    elif lr_schedule_config["core_method"] == "warmup_multistep":
+        print("warmup + multistep is chosen for lr scheduler")
+        from opencood.tools.warmup_multistep_lr import WarmupMultiStepLR
+
+        warmup_epochs = int(lr_schedule_config.get("warmup_epochs", 0))
+        scheduler = WarmupMultiStepLR(
+            optimizer,
+            milestones=lr_schedule_config["step_size"],
+            gamma=lr_schedule_config["gamma"],
+            warmup_epochs=warmup_epochs,
+            warmup_factor=lr_schedule_config.get("warmup_factor", 1.0e-3),
+            n_iter_per_epoch=n_iter_per_epoch,
+        )
     else:
         sys.exit("not supported lr schedular")
 

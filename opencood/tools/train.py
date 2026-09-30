@@ -513,6 +513,9 @@ def main():
                     model.parameters(), max_norm=20.0
                 )
                 optimizer.step()
+            # Per-iteration lr warmup (no-op for non-warmup schedulers).
+            if hasattr(scheduler, "step_iter"):
+                scheduler.step_iter()
             if main_process and grad_norm is not None:
                 gn = float(grad_norm)
                 if math.isfinite(gn):

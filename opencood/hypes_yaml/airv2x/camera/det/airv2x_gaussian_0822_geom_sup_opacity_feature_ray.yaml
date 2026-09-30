@@ -1,0 +1,22 @@
+name: airv2x_gaussian_0822_geom_sup_opacity_feature_ray
+inherit_from: opencood/hypes_yaml/airv2x/camera/det/airv2x_gaussian_0822_geom_sup_opacity_feature.yaml
+yaml_parser: "load_airv2x_heter_params"
+
+model:
+  args:
+    gaussian_refinement:
+      # Ray-aligned scalar depth residual update:
+      #   delta_d = ray_delta_max * tanh(h_ray)
+      #   new_mean = mean + delta_d * unit_ray
+      # "xyz" (parent default) keeps the legacy bounded XYZ update.
+      mean_update_mode: "ray"
+
+      agents:
+        vehicle:
+          ray_delta_max: 2.0
+
+        rsu:
+          ray_delta_max: 2.0
+
+        drone:
+          ray_delta_max: 1.0

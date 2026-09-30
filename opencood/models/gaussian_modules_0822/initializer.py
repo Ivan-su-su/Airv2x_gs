@@ -229,6 +229,7 @@ class GaussianInitializer:
             batch_index=batch_index,
             depth_mean=depth_mean,
             sigma_z=torch.sqrt(depth_var.clamp_min(0.0)),
+            ray_dir=unit_ray,
             agent=agent,
             frame="agent",
         )

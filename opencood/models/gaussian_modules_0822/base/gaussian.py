@@ -10,6 +10,7 @@ import torch
 from opencood.models.gaussian_modules_0822.base.gaussian_transform import (
     quaternion_to_rotation_matrix,
     reconstruct_covariance,
+    transform_directions,
     transform_gaussians,
 )
 
@@ -40,6 +41,9 @@ class GaussianSet:
         batch_index: Optional ``[N]`` sample / agent-batch index.
         depth_mean: Optional ``[N]`` optical-axis depth used as the center.
         sigma_z: Optional ``[N]`` depth / ray scale (meters).
+        ray_dir: Optional ``[N, 3]`` unit observation ray. In the agent
+            frame before ``to_ego()``, in the ego frame afterwards.
+            Provenance only, never a learnable parameter.
         agent: Agent name for this set, or empty if mixed.
         frame: ``\"ego\"`` after agent→ego, else ``\"agent\"``.
     """
@@ -57,6 +61,7 @@ class GaussianSet:
     agent: str = ""
     frame: str = "agent"
     opacity: Optional[torch.Tensor] = None
+    ray_dir: Optional[torch.Tensor] = None
 
     @property
     def n_gaussians(self) -> int:
@@ -109,6 +114,7 @@ class GaussianSet:
             agent=self.agent,
             frame=self.frame,
             opacity=_cast(self.opacity, False),
+            ray_dir=_cast(self.ray_dir, False),
         )
 
     def index_select(self, index: torch.Tensor) -> "GaussianSet":
@@ -153,6 +159,7 @@ class GaussianSet:
             agent=self.agent,
             frame=self.frame,
             opacity=_gather(self.opacity),
+            ray_dir=_gather(self.ray_dir),
         )
 
     def scatter_replace(self, index: torch.Tensor, src: "GaussianSet") -> "GaussianSet":
@@ -193,6 +200,8 @@ class GaussianSet:
         """Apply a rigid agent→ego transform to mean and orientation.
 
         Scale is invariant. Quaternion is updated via ``R_ego @ R_gaussian``.
+        ``ray_dir`` (when present) is a direction: it is rotated by the same
+        per-Gaussian rotation and re-normalized, never translated.
 
         Args:
             agent_to_ego: ``[n_flat, 4, 4]``, ``[N, 4, 4]``, or ``[4, 4]``.
@@ -212,8 +221,22 @@ class GaussianSet:
             agent_to_ego,
             view_index=gather_index,
         )
+        ray_ego = None
+        if self.ray_dir is not None:
+            # Directions transform with R only (no translation); the
+            # broadcast semantics match transform_gaussians above.
+            ray_ego = transform_directions(
+                self.ray_dir,
+                agent_to_ego,
+                view_index=gather_index,
+            )
         return replace(
-            self, mean=mean_ego, scale=scale_ego, quaternion=quat_ego, frame="ego"
+            self,
+            mean=mean_ego,
+            scale=scale_ego,
+            quaternion=quat_ego,
+            ray_dir=ray_ego,
+            frame="ego",
         )
 
     @classmethod
@@ -250,4 +273,5 @@ class GaussianSet:
             sigma_z=torch.empty((0,), device=device, dtype=dtype),
             agent=agent,
             frame=frame,
+            ray_dir=torch.empty((0, 3), device=device, dtype=dtype),
         )

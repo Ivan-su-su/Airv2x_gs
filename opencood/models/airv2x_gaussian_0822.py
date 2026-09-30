@@ -135,6 +135,14 @@ class Airv2xGaussian0822(nn.Module):
         )
 
         refinement_cfg = args["gaussian_refinement"]
+        self.mean_update_mode = str(
+            refinement_cfg.get("mean_update_mode", "xyz")
+        ).lower()
+        if self.mean_update_mode not in ("xyz", "ray"):
+            raise ValueError(
+                "mean_update_mode must be 'xyz' or 'ray', got "
+                f"{self.mean_update_mode!r}"
+            )
         encoder = GaussianGeometryEncoder(
             geo_dim=int(refinement_cfg["geometry"]["geo_dim"]),
             cav_range=args["cav_range"],
@@ -445,5 +453,6 @@ class Airv2xGaussian0822(nn.Module):
                 ),
                 depth_ranges=self.depth_ranges,
                 beta=self.geometry_supervision_beta,
+                mean_update_mode=self.mean_update_mode,
             )
         return output_dict

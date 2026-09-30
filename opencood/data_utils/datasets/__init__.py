@@ -58,6 +58,12 @@ from opencood.data_utils.datasets.airv2x.intermediate_fusion_dataset_bm2cp impor
 from opencood.data_utils.datasets.airv2x.intermediate_fusion_dataset_sicp import (
     IntermediateFusionDatasetAirv2xSiCP,
 )
+from opencood.data_utils.datasets.griffin.homo_drone_dataset import (
+    GriffinHomoDroneDataset,
+)
+from opencood.data_utils.datasets.griffin.homo_vehicle_dataset import (
+    GriffinHomoVehicleDataset,
+)
 from opencood.data_utils.datasets.griffin.intermediate_fusion_dataset import (
     IntermediateFusionDatasetGriffin,
 )
@@ -83,6 +89,8 @@ __all__ = {
     "IntermediateFusionDatasetAirv2xBM2CP": IntermediateFusionDatasetAirv2xBM2CP,
     "IntermediateFusionDatasetAirv2xSiCP": IntermediateFusionDatasetAirv2xSiCP,
     "IntermediateFusionDatasetGriffin": IntermediateFusionDatasetGriffin,
+    "GriffinHomoVehicleDataset": GriffinHomoVehicleDataset,
+    "GriffinHomoDroneDataset": GriffinHomoDroneDataset,
 }
 
 # the final range for evaluation

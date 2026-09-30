@@ -52,6 +52,18 @@ class GaussianRefiner(nn.Module):
             )
             for agent in AGENT_TYPES
         }
+        self.mean_update_mode = str(cfg.get("mean_update_mode", "xyz")).lower()
+        if self.mean_update_mode not in ("xyz", "ray"):
+            raise ValueError(
+                "mean_update_mode must be 'xyz' or 'ray', got "
+                f"{self.mean_update_mode!r}"
+            )
+        ray_delta_max = {
+            agent: float(
+                dict(agent_cfg.get(agent) or {}).get("ray_delta_max", 1.0)
+            )
+            for agent in AGENT_TYPES
+        }
         self.geometry_encoder = geometry_encoder
         self.fusion = RefinementFusion(
             feature_dim=int(feature_dim),
@@ -67,6 +79,8 @@ class GaussianRefiner(nn.Module):
             rotation_max_angle=float(
                 (cfg.get("rotation") or {}).get("max_angle", 0.2)
             ),
+            mean_update_mode=self.mean_update_mode,
+            ray_delta_max=ray_delta_max,
         )
 
     def forward(
@@ -98,6 +112,7 @@ class GaussianRefiner(nn.Module):
             gaussians.scale,
             gaussians.quaternion,
             agent,
+            ray_dir=gaussians.ray_dir,
         )
         return replace(
             gaussians,

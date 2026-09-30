@@ -126,18 +126,19 @@ class P1SplatEncoder(nn.Module):
             torch.inverse(post_rots)
             .view(batch_size, num_cam, 1, 1, 1, 3, 3)
             .matmul(points.unsqueeze(-1))
+            .squeeze(-1)
         )
         points = torch.cat(
             (
                 points[..., :2] * points[..., 2:3],
                 points[..., 2:3],
             ),
-            dim=5,
+            dim=-1,
         )
         combine = rots.matmul(torch.inverse(intrins))
         points = (
             combine.view(batch_size, num_cam, 1, 1, 1, 3, 3)
-            .matmul(points)
+            .matmul(points.unsqueeze(-1))
             .squeeze(-1)
         )
         points += trans.view(batch_size, num_cam, 1, 1, 1, 3)

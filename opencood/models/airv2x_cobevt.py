@@ -9,10 +9,11 @@ from opencood.models.common_modules.downsample_conv import DownsampleConv
 from opencood.models.common_modules.naive_compress import NaiveCompressor
 from opencood.models.common_modules.airv2x_base_model import Airv2xBase
 from opencood.models.common_modules.airv2x_encoder import LiftSplatShootEncoder
+from opencood.models.lss_pretrain_modules.p1_mixin import P1CamMixin
 from opencood.models.task_heads.segmentation_head import BevSegHead
 
 
-class Airv2xCoBEVT(Airv2xBase):
+class Airv2xCoBEVT(P1CamMixin, Airv2xBase):
     def __init__(self, args):
         super().__init__(args)
 
@@ -32,7 +33,12 @@ class Airv2xCoBEVT(Airv2xBase):
         # if "drone" in self.collaborators:
         #     self.drone_model = LiftSplatShootEncoder(args, agent_type="drone")
         
-        self.init_encoders(args)
+        if args.get("p1_checkpoint"):
+            # Frozen Griffin-P1 LSS frontend (same recipe as where2comm /
+            # v2xvit Griffin baselines): camera-only collaborators.
+            P1CamMixin.init_encoders(self, args)
+        else:
+            Airv2xBase.init_encoders(self, args)
 
         self.backbone = BaseBEVBackbone(args["base_bev_backbone"], 64)
 

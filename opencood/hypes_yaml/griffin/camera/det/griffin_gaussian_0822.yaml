@@ -188,11 +188,25 @@ model:
     obj_head: true
     obj_prior_prob: 0.01
 
+    # ---- Switches ported from airv2x_gaussian_0822_geom_sup_opacity_feature_ray ----
+    # Aligned 2026-09-30 with the AirV2X ray recipe:
+    #   geom_sup_opacity_rayupdate_2026_09_25_01_35_04/config.yaml
+    separate_stage12_sampler: true
+    stage1_feature_only: true
+
+    geometry_supervision:
+      enabled: true
+      beta: 1.0
+
     gaussian_range_filter:
       enabled: true
 
     gaussian_refinement:
       enabled: true
+      # 'xyz' (legacy default) or 'ray' (ray-update mode; ray_head is
+      # zero-initialised so a ray model can resume from an xyz ckpt).
+      # Aligned with the AirV2X ray recipe.
+      mean_update_mode: ray
       geometry:
         input_dim: 10
         geo_dim: 64
@@ -201,10 +215,14 @@ model:
       agents:
         vehicle:
           unit_xyz: [2.0, 2.0, 1.0]
+          # Depth residual bound (meters) for mean_update_mode: ray.
+          ray_delta_max: 2.0
         rsu:
           unit_xyz: [2.0, 2.0, 1.0]
+          ray_delta_max: 2.0
         drone:
           unit_xyz: [1.0, 1.0, 1.0]
+          ray_delta_max: 1.0
       scale:
         delta_range: [-0.20, 0.05]
       rotation:
@@ -230,6 +248,15 @@ model:
         detach_covariance: true
         agent_specific: true
         agents: ["vehicle", "drone"]
+        # Feature-conditioned opacity (ray experiment). OFF = legacy
+        # 4-input reliability MLP only, old ckpt keys unchanged.
+        # Aligned with the AirV2X ray recipe: true + stage3.
+        feature_conditioned: true
+        feature_hidden_dim: 32
+        feature_embed_dim: 8
+        fusion_hidden_dim: 8
+        # 'pooled' (legacy) or 'stage3' (ray experiment).
+        final_opacity_source: stage3
 
 ##################
 # Loss Functions #
@@ -247,6 +274,10 @@ loss:
       iou_weight: 0.5
       reg: 2.0
       num_class: *num_class
+      # Stage-2 delta-mean geometry supervision (ray experiment).
+      # >0 activates output_dict["geom_loss"] * geom_weight; 0.0 = off.
+      # Aligned with the AirV2X ray recipe: geom_weight 2.0.
+      geom_weight: 2.0
 
 ###########
 # Learner #

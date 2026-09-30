@@ -168,6 +168,38 @@ def _broadcast_transform(
     return transform_4x4[view_index.long()]
 
 
+def transform_directions(
+    directions: torch.Tensor,
+    transform_4x4: torch.Tensor,
+    view_index: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Rotate unit directions by a rigid transform's rotation, no translation.
+
+    Broadcast semantics match ``_broadcast_transform`` / ``transform_gaussians``:
+    ``[4,4]`` is shared, ``[N,4,4]`` is per-Gaussian, and a per-camera
+    ``[n_cam,4,4]`` stack is gathered with ``view_index``.
+
+    Args:
+        directions: ``[N, 3]`` (any non-zero scale; re-normalized).
+        transform_4x4: Source→destination ``[4,4]`` / ``[N,4,4]`` /
+            ``[n_cam,4,4]``.
+        view_index: Gather index when ``transform_4x4`` is per-camera.
+
+    Returns:
+        Unit directions ``[N, 3]`` in the destination frame.
+    """
+    if directions.numel() == 0:
+        return directions
+    transform = _broadcast_transform(
+        transform_4x4.to(device=directions.device, dtype=directions.dtype),
+        int(directions.shape[0]),
+        view_index,
+    )
+    rotation = transform[:, :3, :3]
+    rotated = torch.matmul(rotation, directions.unsqueeze(-1)).squeeze(-1)
+    return rotated / torch.linalg.norm(rotated, dim=-1, keepdim=True).clamp_min(1.0e-8)
+
+
 def transform_gaussians(
     mean: torch.Tensor,
     scale: torch.Tensor,
