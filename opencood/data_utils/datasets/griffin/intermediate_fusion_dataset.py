@@ -44,6 +44,31 @@ def _pose_to_matrix(pose: Mapping[str, Any]) -> np.ndarray:
     return out
 
 
+def _add_loc_noise(
+    transform: np.ndarray,
+    loc_std: float,
+    seed: int,
+) -> np.ndarray:
+    """Add Gaussian translation noise to a rigid transform.
+
+    Matches Griffin ``AddNoise`` with ``ori_noise_std=0``: x/y/z are drawn
+    independently from ``N(0, loc_std)`` in meters, and rotation is unchanged.
+    The seed is per sample so DataLoader workers stay deterministic.
+
+    Args:
+        transform: ``[4, 4]`` rigid transform.
+        loc_std: Position noise standard deviation in meters.
+        seed: Per-sample RNG seed.
+
+    Returns:
+        A copy of ``transform`` with noisy translation.
+    """
+    rng = np.random.default_rng(seed)
+    noisy = np.array(transform, dtype=np.float64, copy=True)
+    noisy[:3, 3] += rng.normal(0.0, float(loc_std), size=3)
+    return noisy
+
+
 def _scaled_intrinsic(
     intrinsic: np.ndarray,
     original_hw: Tuple[int, int],
@@ -129,6 +154,9 @@ class IntermediateFusionDatasetGriffin(Dataset):
         self.drone_stride = int(cfg.get("drone_stride", 4))
         self.ground_z = float(cfg.get("ground_z", 0.0))
         self.max_ideal_depth = float(cfg.get("max_ideal_depth", 150.0))
+        pose_noise = params.get("pose_noise") or {}
+        self.loc_noise_std = float(pose_noise.get("loc_std", 0.0))
+        self.pose_noise_seed = int(pose_noise.get("seed", 0))
 
         raw_frames = resolve_split_frames(
             self.vehicle_root, self.split, split_json
@@ -159,6 +187,11 @@ class IntermediateFusionDatasetGriffin(Dataset):
             f"vehicle=4cam drone=bottom final={self.final_hw} "
             f"image_scale={self.image_scale} photometric=False"
         )
+        if self.loc_noise_std > 0.0 and not self.train:
+            print(
+                f"[GriffinDet] loc noise std={self.loc_noise_std}m "
+                f"seed={self.pose_noise_seed} (fusion pose only, GT clean)"
+            )
 
     def _configure_anchor_priors(self, split_json: Path) -> None:
         """Use Griffin TRAIN-label medians for class-specific anchor priors."""
@@ -413,6 +446,15 @@ class IntermediateFusionDatasetGriffin(Dataset):
         center, mask, object_ids, class_ids = self._load_boxes(
             frame, t_drone_to_vehicle
         )
+        # Localization error hits the collaborator pose used for fusion.
+        # Boxes stay on the clean vehicle-frame GT.
+        if self.loc_noise_std > 0.0 and not self.train:
+            t_drone_to_vehicle = _add_loc_noise(
+                t_drone_to_vehicle,
+                self.loc_noise_std,
+                self.pose_noise_seed + int(index),
+            )
+            t_vehicle_to_drone = np.linalg.inv(t_drone_to_vehicle)
         class_ids_padded = np.zeros((self.max_num,), dtype=np.int64)
         class_ids_padded[:len(class_ids)] = np.asarray(class_ids, dtype=np.int64)
         label_dict = self.post_processor.generate_label_airv2x(

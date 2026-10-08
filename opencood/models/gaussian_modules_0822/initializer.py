@@ -63,6 +63,9 @@ class GaussianInitializer:
         sigma_t2: Fixed minor tangent scale (meters).
         sigma_d_drone: Fixed drone ray scale (meters).
         pca_radius_px: Heatmap PCA patch half-width in image pixels.
+        tangent_mode: ``pca`` uses the heatmap major axis and
+            ``(sigma_t1, sigma_t2)``. ``circle`` keeps heatmap seeds but
+            sets both tangent scales to ``sqrt(sigma_t1 * sigma_t2)``.
         range_filter: Ego-range filter applied after agent→ego.
         debug: If True, store a small sanity dict on the last forward.
     """
@@ -76,9 +79,15 @@ class GaussianInitializer:
         sigma_t2: float = SIGMA_T2_M,
         sigma_d_drone: float = SIGMA_D_DRONE,
         pca_radius_px: float = PCA_RADIUS_PX,
+        tangent_mode: str = "pca",
         range_filter: Optional[GaussianRangeFilter] = None,
         debug: bool = False,
     ) -> None:
+        mode = str(tangent_mode).lower()
+        if mode not in ("pca", "circle"):
+            raise ValueError(
+                f"tangent_mode must be 'pca' or 'circle', got {tangent_mode!r}"
+            )
         self.z_bins = {k: v.detach().float().reshape(-1) for k, v in (z_bins or {}).items()}
         self.fg_threshold = float(fg_threshold)
         self.local_window_m = float(local_window_m)
@@ -86,6 +95,7 @@ class GaussianInitializer:
         self.sigma_t2 = float(sigma_t2)
         self.sigma_d_drone = float(sigma_d_drone)
         self.pca_radius_px = float(pca_radius_px)
+        self.tangent_mode = mode
         self.range_filter = range_filter
         self.debug = bool(debug)
         self.last_debug: Optional[Dict[str, Any]] = None
@@ -174,17 +184,36 @@ class GaussianInitializer:
 
         depth_mean = depth["depth_mean"]
         depth_var = depth["depth_var"]
-        radius_cells = pca_cell_radius(image_hw, feat_hw, self.pca_radius_px)
-        self.last_pca_by_agent[agent] = {
-            "image_hw": image_hw,
-            "feature_hw": feat_hw,
-            "stride": float(image_hw[0]) / float(feat_hw[0]),
-            "radius_px": self.pca_radius_px,
-            "radius_cells": radius_cells,
-        }
-        v_major, _ = heatmap_pca_direction(
-            p_fg, view_index, y_idx, x_idx, radius=radius_cells
-        )
+        if self.tangent_mode == "circle":
+            # Equal tangent scales make Sigma isotropic in the plane
+            # perpendicular to the ray, so the image-plane footprint is a
+            # circle. Direction no longer enters the covariance.
+            sigma_t = (self.sigma_t1 * self.sigma_t2) ** 0.5
+            sigma_t1 = sigma_t
+            sigma_t2 = sigma_t
+            v_major = torch.zeros(
+                int(view_index.shape[0]), 2, device=device, dtype=dtype
+            )
+            v_major[:, 0] = 1.0
+            self.last_pca_by_agent[agent] = {
+                "tangent_mode": "circle",
+                "sigma_t": float(sigma_t),
+            }
+        else:
+            sigma_t1 = self.sigma_t1
+            sigma_t2 = self.sigma_t2
+            radius_cells = pca_cell_radius(image_hw, feat_hw, self.pca_radius_px)
+            self.last_pca_by_agent[agent] = {
+                "image_hw": image_hw,
+                "feature_hw": feat_hw,
+                "stride": float(image_hw[0]) / float(feat_hw[0]),
+                "radius_px": self.pca_radius_px,
+                "radius_cells": radius_cells,
+                "tangent_mode": "pca",
+            }
+            v_major, _ = heatmap_pca_direction(
+                p_fg, view_index, y_idx, x_idx, radius=radius_cells
+            )
         mean, unit_ray, uv = backproject_optical_z(
             x_indices=x_idx,
             y_indices=y_idx,
@@ -211,8 +240,8 @@ class GaussianInitializer:
             tangent_major=t1,
             tangent_minor=t2,
             sigma_z_sq=depth_var,
-            sigma_t1=self.sigma_t1,
-            sigma_t2=self.sigma_t2,
+            sigma_t1=sigma_t1,
+            sigma_t2=sigma_t2,
         )
         scale, quaternion = covariance_to_scale_quaternion(covariance)
         batch_index = geometry["camera_batch_index"].to(

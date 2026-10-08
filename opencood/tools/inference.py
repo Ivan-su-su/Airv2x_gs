@@ -61,6 +61,24 @@ def test_parser():
     )
     parser.add_argument("--eval_epoch", type=int, default=20, help="Set the checkpoint")
     parser.add_argument(
+        "--num_workers",
+        type=int,
+        default=16,
+        help="DataLoader workers",
+    )
+    parser.add_argument(
+        "--loc_noise_std",
+        type=float,
+        default=0.0,
+        help="Gaussian xyz localization noise std in meters. 0 disables it.",
+    )
+    parser.add_argument(
+        "--pose_noise_seed",
+        type=int,
+        default=0,
+        help="Base seed for per-frame localization noise.",
+    )
+    parser.add_argument(
         "--eval_best_epoch", type=bool, default=False, help="Set the checkpoint"
     )
     parser.add_argument(
@@ -89,6 +107,20 @@ def main():
     ]
 
     hypes = yaml_utils.load_yaml(None, opt)
+    result_name = "result.txt"
+    eval_epoch_tag = None
+    if opt.loc_noise_std > 0:
+        hypes["pose_noise"] = {
+            "loc_std": float(opt.loc_noise_std),
+            "seed": int(opt.pose_noise_seed),
+        }
+        noise_tag = f"loc{opt.loc_noise_std:g}m"
+        result_name = f"result_{noise_tag}.txt"
+        eval_epoch_tag = noise_tag
+        print(
+            f"Localization noise enabled: std={opt.loc_noise_std}m "
+            f"seed={opt.pose_noise_seed}"
+        )
 
     if opt.comm_thre is not None:
         hypes["model"]["args"]["fusion_args"]["communication"]["thre"] = opt.comm_thre
@@ -121,7 +153,7 @@ def main():
     data_loader = DataLoader(
         opencood_dataset,
         batch_size=1,
-        num_workers=16,
+        num_workers=opt.num_workers,
         collate_fn=opencood_dataset.collate_batch_test,
         shuffle=False,
         pin_memory=False,
@@ -284,11 +316,13 @@ def main():
             comm_rates = comm_rates.item()
     else:
         comm_rates = 0
-    ap_30, ap_50, ap_70 = eval_utils.eval_final_results(result_stat, opt.model_dir)
+    ap_30, ap_50, ap_70 = eval_utils.eval_final_results(
+        result_stat, opt.model_dir, eval_epoch=eval_epoch_tag
+    )
     import math
 
     # comm_rates_base2=math.log(comm_rates,2)
-    with open(os.path.join(saved_path, "result.txt"), "a+") as f:
+    with open(os.path.join(saved_path, result_name), "a+") as f:
         msg = "Epoch: {} | AP @0.3: {:.04f} | AP @0.5: {:.04f} | AP @0.7: {:.04f} | comm_rate: {:.06f} \n".format(
             epoch_id, ap_30, ap_50, ap_70, comm_rates
         )

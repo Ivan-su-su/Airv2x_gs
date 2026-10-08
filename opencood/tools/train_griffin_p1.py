@@ -52,6 +52,16 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--epochs", type=int, default=None)
     p.add_argument("--amp", action="store_true")
     p.add_argument("--resume", default=None)
+    p.add_argument(
+        "--drone-only",
+        default=None,
+        help=(
+            "Train ONLY the drone branch. Path to an existing Griffin P1 "
+            "checkpoint whose vehicle weights are loaded, frozen, and "
+            "re-emitted verbatim in every saved checkpoint (structurally "
+            "identical output, drop-in for downstream 0822)."
+        ),
+    )
     return p.parse_args()
 
 
@@ -150,6 +160,69 @@ def _parameter_agent(name: str) -> str:
     raise AssertionError(f"trainable parameter has no unique agent owner: {name}")
 
 
+_VEHICLE_PREFIXES = (
+    "frontend.encoders.vehicle.",
+    "highres.vehicle.",
+    "heatmap_heads.vehicle.",
+    "depth_heads.vehicle.",
+    "r2_downsample.",
+)
+
+
+def load_vehicle_and_freeze(
+    core: GriffinGaussianP1,
+    ckpt_path: str,
+    main_process: bool,
+) -> None:
+    """--drone-only: load vehicle weights, then freeze the whole vehicle branch.
+
+    Drone keeps training from the checkpoint's drone weights (warm start) or
+    ImageNet trunk if the checkpoint has no drone keys. Every saved
+    checkpoint later re-emits the frozen vehicle weights verbatim via
+    ``_merge_vehicle_weights``, so the output stays drop-in compatible with
+    the downstream 0822 loader.
+
+    Args:
+        core: The Griffin P1 model (not DDP-wrapped).
+        ckpt_path: Existing Griffin P1 checkpoint (e.g. 40m best.pth).
+        main_process: Print only on rank 0.
+    """
+    ckpt = torch.load(ckpt_path, map_location="cpu")
+    state = ckpt.get("model_state_dict", ckpt)
+    own = core.state_dict()
+    vehicle_keys = [k for k in own if k.startswith(_VEHICLE_PREFIXES)]
+    matched = {k: state[k] for k in vehicle_keys if k in state}
+    missing = [k for k in vehicle_keys if k not in state]
+    if missing:
+        raise KeyError(
+            f"--drone-only: vehicle keys missing in {ckpt_path}: {missing[:5]}"
+        )
+    own.update(matched)
+    core.load_state_dict(own, strict=True)
+    frozen = 0
+    for name, param in core.named_parameters():
+        if name.startswith(_VEHICLE_PREFIXES):
+            param.requires_grad = False
+            frozen += 1
+    if main_process:
+        print(
+            f"[drone-only] loaded+ froze {len(matched)} vehicle tensors "
+            f"({frozen} params) from {ckpt_path}; drone trains, vehicle is "
+            "re-emitted verbatim on save"
+        )
+
+
+def _merge_vehicle_weights(
+    state: Dict[str, torch.Tensor],
+    frozen_vehicle_state: Dict[str, torch.Tensor],
+) -> Dict[str, torch.Tensor]:
+    """Overwrite vehicle-family tensors with the frozen originals."""
+    out = dict(state)
+    for k, v in frozen_vehicle_state.items():
+        out[k] = v
+    return out
+
+
 def _parameter_family(name: str) -> str:
     if ".trunk." in name:
         return "trunk"
@@ -163,7 +236,10 @@ def _parameter_family(name: str) -> str:
     return "head"
 
 
-def assert_branch_parameter_isolation(model: torch.nn.Module) -> None:
+def assert_branch_parameter_isolation(
+    model: torch.nn.Module,
+    drone_only: bool = False,
+) -> None:
     """Assert Vehicle/Drone own disjoint trainable parameter objects."""
     owners = {"vehicle": {}, "drone": {}}
     for name, param in model.named_parameters():
@@ -171,6 +247,21 @@ def assert_branch_parameter_isolation(model: torch.nn.Module) -> None:
             continue
         agent = _parameter_agent(name)
         owners[agent][name] = id(param)
+
+    if drone_only:
+        # Only the drone branch is trainable; vehicle must be fully frozen.
+        if owners["vehicle"]:
+            raise AssertionError(
+                f"--drone-only but {len(owners['vehicle'])} vehicle tensors "
+                "are still trainable"
+            )
+        if not owners["drone"]:
+            raise AssertionError("--drone-only but drone branch is frozen")
+        print(
+            "[branch isolation] drone-only: "
+            f"drone={len(owners['drone'])} trainable tensors, vehicle frozen"
+        )
+        return
 
     if not owners["vehicle"] or not owners["drone"]:
         raise AssertionError(
@@ -189,7 +280,11 @@ def assert_branch_parameter_isolation(model: torch.nn.Module) -> None:
     )
 
 
-def setup_optimizer(model: torch.nn.Module, cfg: Dict[str, Any]) -> torch.optim.Optimizer:
+def setup_optimizer(
+    model: torch.nn.Module,
+    cfg: Dict[str, Any],
+    drone_only: bool = False,
+) -> torch.optim.Optimizer:
     """AirV2X-style Adam: EfficientNet non-BN trunk at 0.1x base LR."""
     opt = cfg["optimizer"]
     lrs = {
@@ -220,13 +315,20 @@ def setup_optimizer(model: torch.nn.Module, cfg: Dict[str, Any]) -> torch.optim.
         grouped[key].append(param)
         grouped_names[key].append(name)
 
-    # All six groups should be populated in this two-agent design.
-    empty = [key for key, params in grouped.items() if not params]
+    # All six groups should be populated in the full two-agent design; in
+    # --drone-only mode the three frozen vehicle groups are expected empty.
+    empty = [
+        key
+        for key, params in grouped.items()
+        if not params and not (drone_only and key[0] == "vehicle")
+    ]
     if empty:
         raise AssertionError(f"empty optimizer groups: {empty}")
 
     param_groups = []
     for agent in ("vehicle", "drone"):
+        if drone_only and agent == "vehicle":
+            continue
         for family in ("trunk", "feature", "head"):
             params = grouped[(agent, family)]
             param_groups.append(
@@ -248,6 +350,7 @@ def setup_optimizer(model: torch.nn.Module, cfg: Dict[str, Any]) -> torch.optim.
 def assert_branch_gradient_isolation(
     model: torch.nn.Module,
     loss_parts: Dict[str, torch.Tensor],
+    drone_only: bool = False,
 ) -> None:
     """One-time autograd check: each agent loss must be disconnected from the other branch."""
     vehicle_params = []
@@ -259,6 +362,20 @@ def assert_branch_gradient_isolation(
             vehicle_params.append(param)
         else:
             drone_params.append(param)
+
+    if drone_only:
+        # Only the drone loss needs to reach drone params; vehicle tensors
+        # are frozen (requires_grad=False) and never appear here.
+        drone_to_drone = torch.autograd.grad(
+            loss_parts["drone"],
+            drone_params,
+            retain_graph=True,
+            allow_unused=True,
+        )
+        if not any(grad is not None for grad in drone_to_drone):
+            raise AssertionError("Drone loss is disconnected from its own branch")
+        print("[gradient isolation] PASS (drone-only): drone loss -> drone only")
+        return
 
     veh_to_drone = torch.autograd.grad(
         loss_parts["vehicle"],
@@ -324,20 +441,32 @@ def batch_loss_metrics(
     depth_criterion: GaussianP1DepthLoss,
     cfg: Dict[str, Any],
     use_amp: bool,
+    drone_only: bool = False,
 ) -> Tuple[torch.Tensor, Dict[str, float], Dict[str, torch.Tensor]]:
     loss_cfg = cfg.get("loss", {})
     gamma = float(loss_cfg.get("heatmap_gamma", 2.0))
     w_v_hm = float(loss_cfg.get("vehicle_heatmap_weight", 1.0))
     w_d_hm = float(loss_cfg.get("drone_heatmap_weight", 1.0))
     w_v_depth = float(loss_cfg.get("vehicle_depth_weight", 1.0))
+    alpha_cfg = loss_cfg.get("heatmap_alpha_fg")
+    alpha_fg = float(alpha_cfg) if alpha_cfg is not None else None
 
     with amp.autocast(enabled=use_amp):
         pred = model(batch)
 
         v_hm = flatten_views(batch["vehicle"]["heatmap_target"]).long()
         d_hm = flatten_views(batch["drone"]["heatmap_target"]).long()
-        v_hm_loss = softmax_focal_loss(pred["vehicle"]["heatmap_logits"], v_hm, gamma)
-        d_hm_loss = softmax_focal_loss(pred["drone"]["heatmap_logits"], d_hm, gamma)
+        if drone_only:
+            # Vehicle loss is unused for the gradient; keep tensors for
+            # metrics only, at zero cost to the backward pass.
+            v_hm_loss = pred["vehicle"]["heatmap_logits"].sum() * 0.0
+        else:
+            v_hm_loss = softmax_focal_loss(
+                pred["vehicle"]["heatmap_logits"], v_hm, gamma, alpha_fg
+            )
+        d_hm_loss = softmax_focal_loss(
+            pred["drone"]["heatmap_logits"], d_hm, gamma, alpha_fg
+        )
 
         z_gt = flatten_views(batch["vehicle"]["camera_z_gt"]).float()
         valid0 = flatten_views(batch["vehicle"]["depth_valid"]).bool()
@@ -346,17 +475,20 @@ def batch_loss_metrics(
         mode = str(veh_cam_cfg["grid_conf"]["mode"])
         depth_target, depth_valid = build_depth_target(z_gt, valid0, ddiscr, mode)
 
-        v_depth_loss = depth_criterion(
-            {"vehicle": pred["vehicle"]},
-            {"vehicle": depth_target},
-            {"vehicle": v_hm},
-            {"vehicle": depth_valid},
-            camera_z_gts={"vehicle": z_gt},
-        )
-        v_depth_loss = v_depth_loss + 0.0 * pred["vehicle"]["depth_logits"].sum()
+        if drone_only:
+            v_depth_loss = pred["vehicle"]["depth_logits"].sum() * 0.0
+        else:
+            v_depth_loss = depth_criterion(
+                {"vehicle": pred["vehicle"]},
+                {"vehicle": depth_target},
+                {"vehicle": v_hm},
+                {"vehicle": depth_valid},
+                camera_z_gts={"vehicle": z_gt},
+            )
+            v_depth_loss = v_depth_loss + 0.0 * pred["vehicle"]["depth_logits"].sum()
         vehicle_total = w_v_hm * v_hm_loss + w_v_depth * v_depth_loss
         drone_total = w_d_hm * d_hm_loss
-        total = vehicle_total + drone_total
+        total = drone_total if drone_only else vehicle_total + drone_total
 
     metrics: Dict[str, float] = {
         "loss_total": float(total.detach().item()),
@@ -400,6 +532,7 @@ def validate(
     use_amp: bool,
     distributed: bool,
     rank: int,
+    drone_only: bool = False,
 ) -> Dict[str, float]:
     model.eval()
     sums: Dict[str, float] = {}
@@ -413,7 +546,7 @@ def validate(
         ):
             batch = move_nested(batch, device)
             _loss, metrics, _parts = batch_loss_metrics(
-                model, batch, criterion, cfg, use_amp
+                model, batch, criterion, cfg, use_amp, drone_only=drone_only
             )
             count += 1
             for k, v in metrics.items():
@@ -432,11 +565,17 @@ def save_ckpt(
     scaler: amp.GradScaler,
     cfg: Dict[str, Any],
     val_metrics: Dict[str, float],
+    frozen_vehicle_state: Dict[str, torch.Tensor] = None,
 ) -> None:
+    state = _core_model(model).state_dict()
+    if frozen_vehicle_state:
+        # --drone-only: re-emit the frozen vehicle tensors verbatim so the
+        # checkpoint stays drop-in compatible with the downstream loader.
+        state = _merge_vehicle_weights(state, frozen_vehicle_state)
     torch.save(
         {
             "epoch": epoch,
-            "model_state_dict": _core_model(model).state_dict(),
+            "model_state_dict": state,
             "optimizer_state_dict": optimizer.state_dict(),
             "scheduler_state_dict": scheduler.state_dict(),
             "scaler_state_dict": scaler.state_dict(),
@@ -516,13 +655,24 @@ def main() -> None:
 
     # CamEncode internally loads ImageNet EfficientNet-B0. Griffin P1 modules
     # start fresh; do not load AirV2X task-specific P1 weights.
+    drone_only = args.drone_only is not None
     core = GriffinGaussianP1(cfg["model"]).to(device)
-    if main_process:
+    frozen_vehicle_state: Dict[str, torch.Tensor] = {}
+    if drone_only:
+        ckpt = torch.load(args.drone_only, map_location="cpu")
+        prior = ckpt.get("model_state_dict", ckpt)
+        load_vehicle_and_freeze(core, args.drone_only, main_process)
+        frozen_vehicle_state = {
+            k: v.clone()
+            for k, v in prior.items()
+            if k.startswith(_VEHICLE_PREFIXES)
+        }
+    elif main_process:
         print("[init] ImageNet EfficientNet-B0 only; no AirV2X P1 checkpoint")
     core.assert_train_eval_state(True)
-    assert_branch_parameter_isolation(core)
+    assert_branch_parameter_isolation(core, drone_only=drone_only)
 
-    optimizer = setup_optimizer(core, cfg)
+    optimizer = setup_optimizer(core, cfg, drone_only=drone_only)
     epochs = int(cfg["train"].get("epochs", 50))
     sched_cfg = cfg.get("lr_scheduler", {})
     scheduler = torch.optim.lr_scheduler.MultiStepLR(
@@ -545,7 +695,9 @@ def main() -> None:
         writer = None
 
     start_epoch = 0
-    best_val = float("inf")
+    # drone-only selects best by drone_hm/recall@0.3 (max); otherwise by
+    # minimum total loss.
+    best_val = -1.0 if drone_only else float("inf")
     if args.resume:
         ckpt = torch.load(args.resume, map_location=device)
         core.load_state_dict(ckpt["model_state_dict"], strict=True)
@@ -567,9 +719,9 @@ def main() -> None:
         probe_batch = next(iter(train_loader))
         probe_batch = move_nested(probe_batch, device)
         _probe_total, _probe_metrics, probe_parts = batch_loss_metrics(
-            core, probe_batch, depth_criterion, cfg, use_amp
+            core, probe_batch, depth_criterion, cfg, use_amp, drone_only=drone_only
         )
-        assert_branch_gradient_isolation(core, probe_parts)
+        assert_branch_gradient_isolation(core, probe_parts, drone_only=drone_only)
         del probe_batch, _probe_total, _probe_metrics, probe_parts
         torch.cuda.empty_cache()
     if distributed:
@@ -613,7 +765,7 @@ def main() -> None:
             batch = move_nested(batch, device)
             optimizer.zero_grad(set_to_none=True)
             total, metrics, _loss_parts = batch_loss_metrics(
-                model, batch, depth_criterion, cfg, use_amp
+                model, batch, depth_criterion, cfg, use_amp, drone_only=drone_only
             )
             scaler.scale(total).backward()
             if float(cfg["train"].get("grad_clip", 0.0)) > 0:
@@ -650,6 +802,7 @@ def main() -> None:
             use_amp,
             distributed=distributed,
             rank=rank,
+            drone_only=drone_only,
         )
         scheduler.step()
 
@@ -678,9 +831,25 @@ def main() -> None:
                 scaler,
                 cfg,
                 val_metrics,
+                frozen_vehicle_state=frozen_vehicle_state or None,
             )
-            if val_metrics.get("loss_total", float("inf")) < best_val:
-                best_val = float(val_metrics["loss_total"])
+            # Best selection: drone-only tracks downstream-aligned heatmap
+            # F1 at the 0.3 seed threshold (higher is better); the full
+            # run keeps the historical minimum total loss. F1, not recall:
+            # maximizing recall alone rewards all-firing maps (see the
+            # epoch-9 best.pth with precision 0.067).
+            if drone_only:
+                best_key = "drone_hm/f1@0.3"
+                improved = val_metrics.get(best_key, 0.0) > best_val
+            else:
+                best_key = "loss_total"
+                improved = val_metrics.get(best_key, float("inf")) < best_val
+            if improved:
+                best_val = (
+                    float(val_metrics[best_key])
+                    if val_metrics.get(best_key) is not None
+                    else best_val
+                )
                 save_ckpt(
                     output_dir / "best.pth",
                     epoch,
@@ -690,6 +859,7 @@ def main() -> None:
                     scaler,
                     cfg,
                     val_metrics,
+                    frozen_vehicle_state=frozen_vehicle_state or None,
                 )
             save_every = int(cfg["train"].get("save_every", 5))
             if save_every > 0 and (epoch + 1) % save_every == 0:
@@ -702,6 +872,7 @@ def main() -> None:
                     scaler,
                     cfg,
                     val_metrics,
+                    frozen_vehicle_state=frozen_vehicle_state or None,
                 )
 
         if distributed:

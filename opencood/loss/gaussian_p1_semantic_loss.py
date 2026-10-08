@@ -13,34 +13,51 @@ def softmax_focal_loss(
     logits: torch.Tensor,
     target: torch.Tensor,
     gamma: float = 2.0,
+    alpha_fg: Optional[float] = None,
 ) -> torch.Tensor:
-    """Mean 2-class softmax focal loss. No alpha / class weights.
+    """Mean 2-class softmax focal loss, optionally fg-class weighted.
 
     For each cell ``y``:
 
         CE = cross_entropy(logits, y, reduction="none")
         p_t = softmax(logits)[y]
-        FL = (1 - p_t) ** gamma * CE
+        FL = alpha_t * (1 - p_t) ** gamma * CE
+
+    ``alpha_fg`` up-weights the rare foreground class (drone fg occupies only
+    a few percent of cells), pushing weak far/small-object responses past the
+    downstream 0.3 seed threshold. ``alpha_fg=None`` (default) keeps the exact
+    historical unweighted behaviour.
 
     Args:
         logits: ``[N, 2, H, W]`` raw logits. Channel 0=bg, 1=fg.
         target: ``[N, H, W]`` long ids in ``{0, 1}``.
         gamma: Focusing parameter. ``gamma=0`` recovers ordinary CE.
+        alpha_fg: Optional weight for the fg class; bg gets ``1 - alpha_fg``.
 
     Returns:
         Scalar mean over all cells.
 
     Raises:
-        ValueError: If logits are not 2-class ``[N, 2, H, W]``.
+        ValueError: If logits are not 2-class ``[N, 2, H, W]`` or ``alpha_fg``
+            is outside (0, 1).
     """
     if logits.dim() != 4 or int(logits.shape[1]) != 2:
         raise ValueError(
             f"softmax_focal_loss expects [N,2,H,W] logits, got {tuple(logits.shape)}"
         )
+    if alpha_fg is not None and not 0.0 < float(alpha_fg) < 1.0:
+        raise ValueError(f"alpha_fg must be in (0,1), got {alpha_fg}")
     ce = F.cross_entropy(logits, target, reduction="none")
     probs = torch.softmax(logits, dim=1)
     p_t = probs.gather(1, target.unsqueeze(1)).squeeze(1)
     focal_weight = (1.0 - p_t).pow(float(gamma))
+    if alpha_fg is not None:
+        alpha_t = torch.where(
+            target.eq(1),
+            torch.full_like(p_t, float(alpha_fg)),
+            torch.full_like(p_t, 1.0 - float(alpha_fg)),
+        )
+        focal_weight = alpha_t * focal_weight
     return (focal_weight * ce).mean()
 
 

@@ -123,11 +123,13 @@ class Airv2xGaussian0822(nn.Module):
         self.drone_height_embed = HeightEmbedding()
         self.drone_delta_head = DeltaHead()
 
+        init_cfg = args.get("gaussian_init") or {}
         self.initializer = GaussianInitializer(
             z_bins={
                 agent: moments.z_bins
                 for agent, moments in self.depth_moments.items()
             },
+            tangent_mode=str(init_cfg.get("tangent_mode", "pca")),
             range_filter=GaussianRangeFilter(
                 args["cav_range"],
                 enabled=bool(args["gaussian_range_filter"]["enabled"]),

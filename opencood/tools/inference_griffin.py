@@ -1,5 +1,10 @@
 # -*- coding: utf-8 -*-
-"""Evaluate Griffin full Gaussian detector with OpenCOOD multiclass IoU AP."""
+"""Evaluate Griffin Gaussian detector: class-agnostic AP (primary) + multiclass mAP (reference).
+
+The class-agnostic metric merges detections across classes and matches the
+classic ``inference.py`` protocol, so numbers are directly comparable with
+historical 55m results.
+"""
 
 from __future__ import annotations
 
@@ -114,6 +119,8 @@ def main():
 
     result_stat = defaultdict(dict)
     iou_thresholds = (0.3, 0.5, 0.7)
+    # Classic class-agnostic stat: result_stat[iou] = {"score": [], "tp": [], "fp": [], "gt": 0}
+    cls_agnostic_stat = {iou: {"score": [], "tp": [], "fp": [], "gt": 0} for iou in iou_thresholds}
 
     with torch.no_grad():
         for batch in tqdm(loader, desc=f"Griffin eval epoch={epoch_id}"):
@@ -140,6 +147,14 @@ def main():
                     iou_thresh=iou,
                     result_stat=result_stat,
                 )
+                # Class-agnostic AP: ignore labels, merge all classes into one pool.
+                eval_utils.caluclate_tp_fp(
+                    pred_box,
+                    pred_score,
+                    gt_box,
+                    cls_agnostic_stat,
+                    iou_thresh=iou,
+                )
 
     lines = []
     for iou in iou_thresholds:
@@ -148,9 +163,13 @@ def main():
             iou_thresh=iou,
             global_sort_detections=True,
         )
+        agnostic_ap, _, _ = eval_utils.calculate_ap(
+            cls_agnostic_stat, iou, global_sort_detections=True
+        )
         lines.append(
             f"epoch={epoch_id} split={tag} IoU={iou:.1f} "
-            f"AP={ap_per_class} mAP={mean_ap:.4f}"
+            f"AP={agnostic_ap:.4f} (class-agnostic) | "
+            f"mAP={mean_ap:.4f} per-class={ap_per_class}"
         )
 
     out_path = os.path.join(

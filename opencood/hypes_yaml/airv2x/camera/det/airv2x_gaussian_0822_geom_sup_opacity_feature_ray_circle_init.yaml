@@ -1,0 +1,10 @@
+name: airv2x_gaussian_0822_geom_sup_opacity_feature_ray_circle_init
+inherit_from: opencood/hypes_yaml/airv2x/camera/det/airv2x_gaussian_0822_geom_sup_opacity_feature_ray.yaml
+yaml_parser: "load_airv2x_heter_params"
+
+model:
+  args:
+    # Heatmap still selects seeds. Tangent scales are equal, so the
+    # image-plane footprint is a circle instead of the heatmap-PCA ellipse.
+    gaussian_init:
+      tangent_mode: circle
